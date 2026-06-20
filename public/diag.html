@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>臻臻 - 连接诊断</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui; background: #0f0f0f; color: #e0e0e0; padding: 20px; max-width: 500px; margin: 0 auto; }
+h1 { font-size: 20px; margin: 16px 0 12px; }
+.card { background: #1a1a1a; border-radius: 12px; padding: 16px; margin: 8px 0; border: 1px solid #333; }
+.pass { color: #5cb878; }
+.fail { color: #e05555; }
+.wait { color: #f0a040; }
+pre { background: #111; padding: 8px; border-radius: 8px; font-size: 11px; overflow-x: auto; margin-top: 8px; white-space: pre-wrap; word-break: break-all; }
+.btn { display: block; width: 100%; padding: 14px; border: none; border-radius: 12px; font-size: 16px; font-weight: 700; cursor: pointer; margin: 8px 0; }
+.btn-go { background: #5cb878; color: #000; }
+.btn-fix { background: #c08030; color: #fff; }
+.btn-danger { background: #e05555; color: #fff; }
+input { width: 100%; padding: 12px 14px; border-radius: 10px; border: 1px solid #444; background: #111; color: #e0e0e0; font-size: 14px; margin: 8px 0; }
+.dim { font-size: 12px; color: #999; padding: 4px 0; border-bottom: 1px solid #222; font-family: monospace; }
+</style>
+</head>
+<body>
+<h1>🔍 臻臻 AI 连接诊断</h1>
+<div id="keySection" class="card">
+  <strong>🔑 API Key</strong>
+  <p style="font-size:13px;color:#999;margin:4px 0;">从 <a href="https://platform.deepseek.com/" target="_blank" rel="noopener noreferrer" style="color:#5cb878;">platform.deepseek.com</a> 获取</p>
+  <input type="password" id="keyInput" placeholder="sk-xxxxxxxxxxxxxxxx" autocomplete="off" />
+  <div style="display:flex;gap:8px;">
+    <button onclick="setKey()" style="flex:1;padding:10px;border:none;border-radius:8px;background:#5cb878;color:#000;font-weight:700;cursor:pointer;">保存 Key</button>
+    <button onclick="toggleShow()" style="padding:10px 16px;border:none;border-radius:8px;background:#333;color:#999;cursor:pointer;">👁</button>
+  </div>
+</div>
+<div id="results"></div>
+
+<script>
+var showing = false;
+window.toggleShow = function() {
+  showing = !showing;
+  document.getElementById('keyInput').type = showing ? 'text' : 'password';
+};
+
+function getKey() {
+  var inputVal = document.getElementById('keyInput').value.trim();
+  if (inputVal) return inputVal;
+  return localStorage.getItem('zhenzhen-api-key') || null;
+}
+
+window.setKey = function() {
+  var key = document.getElementById('keyInput').value.trim();
+  if (!key) return;
+  localStorage.setItem('zhenzhen-api-key', key);
+  localStorage.removeItem('zhenzhen-last-error');
+  localStorage.removeItem('zhenzhen-last-error-time');
+  add('Key 保存', 'ok', '已保存: ' + key.slice(0,8) + '...' + key.slice(-4));
+  runDiag();
+};
+
+// 自动填入已有 Key
+var existing = localStorage.getItem('zhenzhen-api-key');
+if (existing) {
+  document.getElementById('keyInput').value = existing;
+  document.getElementById('keyInput').type = 'password';
+}
+
+const out = document.getElementById('results');
+
+function add(title, status, detail) {
+  const cls = status === 'ok' ? 'pass' : status === 'fail' ? 'fail' : 'wait';
+  const icon = status === 'ok' ? '✅' : status === 'fail' ? '❌' : '⏳';
+  const d = document.createElement('div');
+  d.className = 'card';
+  d.innerHTML = '<strong>' + icon + ' ' + title + '</strong><br><span class="' + cls + '">' + detail + '</span>';
+  if (status === 'fail' && detail.length > 20) {
+    d.innerHTML += '<pre>' + detail.slice(0, 300) + '</pre>';
+  }
+  out.appendChild(d);
+}
+
+async function runDiag() {
+  out.innerHTML = '';
+  var KEY = getKey();
+
+  // 1. localStorage
+  try {
+    if (KEY) {
+      add('localStorage 读取', 'ok', 'Key 已存储: ' + KEY.slice(0,8) + '...' + KEY.slice(-4));
+    } else {
+      add('localStorage 读取', 'fail', '未找到 API Key，请在输入框中填写你的 DeepSeek API Key，然后点击"保存 Key"。');
+    }
+  } catch(e) {
+    add('localStorage', 'fail', '读写失败: ' + e.message);
+  }
+
+  // 2. 环境检测
+  const hostname = window.location.hostname;
+  const isDev = hostname === 'localhost' || hostname === '127.0.0.1' || hostname.startsWith('192.168.');
+  const apiUrl = isDev ? '/api/deepseek/chat/completions' : 'https://api.deepseek.com/chat/completions';
+  add('环境检测', 'ok', (isDev ? '开发(localhost) → Vite 代理' : '生产 → 直连 DeepSeek') + '，API URL: ' + apiUrl);
+
+  // 3. Service Worker
+  try {
+    const regs = await navigator.serviceWorker?.getRegistrations() || [];
+    if (regs.length > 0) {
+      add('Service Worker', 'wait', '发现 ' + regs.length + ' 个 SW。可点击下方"清理 SW"按钮清除。');
+    } else {
+      add('Service Worker', 'ok', '无注册的 SW');
+    }
+  } catch(e) {
+    add('Service Worker', 'fail', '检查失败: ' + e.message);
+  }
+
+  if (!KEY) {
+    add('⏸ 跳过 API 测试', 'wait', '需要先配置 API Key 才能测试连接。');
+    showSummary(0);
+    return;
+  }
+
+  // 4. 测试连接
+  add('API 连接测试', 'wait', '正在调用 DeepSeek API...');
+  try {
+    const t0 = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(function() { controller.abort(); }, 15000);
+    const res = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + KEY },
+      body: JSON.stringify({ model: 'deepseek-chat', max_tokens: 20, messages: [{ role: 'user', content: 'say OK' }] }),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    const dt = Date.now() - t0;
+    const data = await res.json().catch(function() { return {}; });
+    if (res.ok && data.choices?.[0]?.message?.content) {
+      add('API 连接测试', 'ok', '延迟 ' + dt + 'ms, AI 回复: "' + data.choices[0].message.content + '"');
+    } else {
+      const errMsg = data.error?.message || 'HTTP ' + res.status;
+      add('API 连接测试', 'fail', 'HTTP ' + res.status + ': ' + errMsg);
+    }
+  } catch(e) {
+    add('API 连接测试', 'fail', e.name === 'AbortError' ? '请求超时（>15秒），请检查网络。' : '网络错误: ' + e.message);
+  }
+
+  // 5. CORS 检测
+  try {
+    const t0 = Date.now();
+    const controller = new AbortController();
+    const timeout = setTimeout(function() { controller.abort(); }, 10000);
+    const res = await fetch('https://api.deepseek.com/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + KEY },
+      body: JSON.stringify({ model: 'deepseek-chat', max_tokens: 10, messages: [{ role: 'user', content: 'say OK' }] }),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    const dt = Date.now() - t0;
+    if (res.ok) {
+      add('直连 CORS 测试', 'ok', '延迟 ' + dt + 'ms，CORS 跨域请求成功');
+    } else {
+      const data = await res.json().catch(function() { return {}; });
+      add('直连 CORS 测试', 'fail', 'HTTP ' + res.status + ': ' + (data.error?.message || 'unknown'));
+    }
+  } catch(e) {
+    add('直连 CORS 测试', 'fail', e.name === 'AbortError' ? '直连超时（>10秒）。' : 'CORS/网络错误: ' + e.message);
+  }
+
+  // 总结
+  showSummary(document.querySelectorAll('.fail').length);
+}
+
+function showSummary(errors) {
+  if (errors === 0) {
+    const d = document.createElement('div');
+    d.className = 'card';
+    d.style.borderColor = '#5cb878';
+    d.innerHTML = '<strong style="font-size:18px">🎉 所有检测通过！AI 连接正常。</strong><br><br><a href="/zhenzhen/" style="color:#5cb878;font-weight:700;font-size:16px;">→ 进入臻臻 App</a>';
+    out.appendChild(d);
+  } else {
+    const d = document.createElement('div');
+    d.className = 'card';
+    d.style.borderColor = '#e05555';
+    d.innerHTML = '<strong style="font-size:18px">⚠️ 发现 ' + errors + ' 个问题</strong><br><br>' +
+      '<button class="btn btn-fix" onclick="fixAll()">🔧 修复常见问题（清缓存+SW）</button>' +
+      '<button class="btn btn-danger" onclick="clearAppData()">🗑 清除臻臻所有数据</button>' +
+      '<p style="font-size:12px;color:#999;margin-top:8px;">修复后请刷新页面重新诊断</p>';
+    out.appendChild(d);
+  }
+}
+
+window.fixAll = function() {
+  localStorage.removeItem('zhenzhen-last-error');
+  localStorage.removeItem('zhenzhen-last-error-time');
+  caches.keys().then(function(names) { names.forEach(function(n) { caches.delete(n); }); });
+  navigator.serviceWorker?.getRegistrations().then(function(regs) { regs.forEach(function(r) { r.unregister(); }); });
+  alert('已清理缓存和 Service Worker！刷新后生效。');
+  location.reload();
+};
+
+window.clearAppData = function() {
+  var keys = [];
+  for (var i = 0; i < localStorage.length; i++) {
+    var k = localStorage.key(i);
+    if (k && k.startsWith('zhenzhen-')) keys.push(k);
+  }
+  if (!keys.length) { alert('没有需要清除的数据。'); return; }
+  if (!confirm('将清除以下数据（共' + keys.length + '项）：\n' + keys.join(', ') + '\n\n确定吗？此操作不可恢复。')) return;
+  keys.forEach(function(k) { localStorage.removeItem(k); });
+  alert('已清除。Key 也清除了，请在输入框中重新填写。');
+  location.reload();
+};
+
+runDiag();
+</script>
+</body>
+</html>

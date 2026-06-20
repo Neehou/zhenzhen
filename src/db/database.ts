@@ -144,6 +144,41 @@ export const DEFAULT_EXERCISES = [
     bodyPart: '腿',
     instructions: '双脚与肩同宽，蹲至大腿平行地面。',
   },
+  {
+    id: 'plank',
+    name: '平板支撑',
+    category: 'bodyweight' as const,
+    bodyPart: '核心',
+    instructions: '肘撑地，身体成一条直线，收紧腹部和臀部，保持呼吸。',
+  },
+  {
+    id: 'crunch',
+    name: '卷腹',
+    category: 'bodyweight' as const,
+    bodyPart: '核心',
+    instructions: '仰卧屈膝，下巴收紧，用腹部力量卷起上半身，不要抱头拉脖子。',
+  },
+  {
+    id: 'lunge',
+    name: '弓步蹲',
+    category: 'bodyweight' as const,
+    bodyPart: '腿',
+    instructions: '前后脚站立，下蹲至双膝90度，保持上身直立。',
+  },
+  {
+    id: 'bench-press',
+    name: '杠铃卧推',
+    category: 'strength' as const,
+    bodyPart: '胸',
+    instructions: '收紧肩胛骨，杠铃下放至胸骨，推起时手臂不锁死。',
+  },
+  {
+    id: 'deadlift',
+    name: '硬拉',
+    category: 'strength' as const,
+    bodyPart: '背',
+    instructions: '挺胸收背，杠铃贴紧小腿，髋膝同步伸展。',
+  },
 ];
 
 // ============ 数据库操作辅助函数 ============

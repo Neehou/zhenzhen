@@ -3,7 +3,12 @@
 import type { WorkoutSession, DailyPlan, PlannedExercise } from '../types';
 import { db, DEFAULT_EXERCISES, getOrCreateProfile, generateId } from '../db/database';
 
-const DEEPSEEK_API = 'https://api.deepseek.com/chat/completions';
+// API 端点列表 — 按优先级排列，一个不通就换下一个
+const API_ENDPOINTS = [
+  '/api/deepseek/chat/completions',           // Vite 代理（开发环境）
+  'https://api.deepseek.com/chat/completions', // DeepSeek 直连
+];
+
 const MODEL = 'deepseek-chat';
 
 function getApiKey(): string | null {
@@ -12,6 +17,8 @@ function getApiKey(): string | null {
 
 export function setApiKey(key: string): void {
   localStorage.setItem('zhenzhen-api-key', key);
+  // 新 Key 保存时清除旧错误，给新 Key 一次干净的机会
+  clearAIError();
 }
 
 export function hasApiKey(): boolean {
@@ -21,7 +28,15 @@ export function hasApiKey(): boolean {
 export function getAIStatus(): 'connected' | 'no-key' | 'error' {
   if (!getApiKey()) return 'no-key';
   const lastErr = localStorage.getItem('zhenzhen-last-error');
-  if (lastErr) return 'error';
+  if (lastErr) {
+    // 超过 30 分钟的错误自动清除（可能是网络波动）
+    const errTime = localStorage.getItem('zhenzhen-last-error-time');
+    if (errTime && Date.now() - parseInt(errTime) > 30 * 60 * 1000) {
+      clearAIError();
+      return 'connected';
+    }
+    return 'error';
+  }
   return 'connected';
 }
 
@@ -36,7 +51,9 @@ export async function testConnection(): Promise<boolean> {
     clearAIError();
     return true;
   } catch (e) {
-    localStorage.setItem('zhenzhen-last-error', String(e).slice(0, 200));
+    const msg = String(e).slice(0, 200);
+    localStorage.setItem('zhenzhen-last-error', msg);
+    localStorage.setItem('zhenzhen-last-error-time', String(Date.now()));
     return false;
   }
 }
@@ -45,33 +62,72 @@ async function callDeepSeek(systemPrompt: string, userMessage: string, maxTokens
   const apiKey = getApiKey();
   if (!apiKey) throw new Error('请先在设置中填写 DeepSeek API Key。');
 
-  const res = await fetch(DEEPSEEK_API, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: maxTokens,
-      temperature: 0.3,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage },
-      ],
-    }),
+  const body = JSON.stringify({
+    model: MODEL,
+    max_tokens: maxTokens,
+    temperature: 0.3,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userMessage },
+    ],
   });
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    const msg = err.error?.message || `API 请求失败 (${res.status})`;
-    localStorage.setItem('zhenzhen-last-error', msg);
-    throw new Error(msg);
+  // 依次尝试所有端点，一个不通就换下一个，每个端点15秒超时
+  let lastError: Error | null = null;
+  for (let i = 0; i < API_ENDPOINTS.length; i++) {
+    const url = API_ENDPOINTS[i];
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (res.ok) {
+        const data = await res.json();
+        clearAIError();
+        return data.choices[0].message.content;
+      }
+
+      // HTTP 错误 — 认证错误不重试（换端点也没用）
+      const err = await res.json().catch(() => ({}));
+      const rawMsg = err.error?.message || `API 请求失败 (${res.status})`;
+
+      if (res.status === 401 || res.status === 403) {
+        const msg = rawMsg.includes('Authentication') || rawMsg.includes('invalid')
+          ? 'API Key 无效 — 请在 DeepSeek 平台检查 Key 是否正确、是否有余额。'
+          : rawMsg;
+        localStorage.setItem('zhenzhen-last-error', msg);
+        localStorage.setItem('zhenzhen-last-error-time', String(Date.now()));
+        throw new Error(msg); // 认证错误不重试
+      }
+
+      // 其他 HTTP 错误，记录并尝试下个端点
+      lastError = new Error(rawMsg);
+      console.warn(`[臻臻] 端点${i + 1} 失败 (${url}): ${rawMsg}`);
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if ((e as Error).message?.includes('API Key 无效')) throw e; // 认证错误立即抛出
+      if ((e as Error).name === 'AbortError') {
+        lastError = new Error(`请求超时 (${url})`);
+      } else {
+        lastError = e as Error;
+      }
+      console.warn(`[臻臻] 端点${i + 1} 不可达 (${url}): ${(e as Error).message}`);
+    }
   }
 
-  const data = await res.json();
-  clearAIError(); // 通信成功，清除错误
-  return data.choices[0].message.content;
+  // 所有端点都失败
+  const msg = lastError?.message || '所有 API 端点均不可达';
+  throw new Error(msg);
 }
 
 // ==================== 构建训练历史摘要 ====================
@@ -193,14 +249,15 @@ export interface ParsedInput {
   exerciseId: string;
   exerciseName: string;
   weight?: number;
-  reps?: number;
+  reps?: number;       // 每组次数
+  sets?: number;       // 组数
   distance?: number;
   duration?: number;
   rpe?: number;
 }
 
 export interface CoachResponse {
-  parsed: ParsedInput;
+  parsed?: ParsedInput;  // 无则为自由对话，有则为训练数据
   comment: string;
 }
 
@@ -209,6 +266,9 @@ const EXERCISE_LIST = DEFAULT_EXERCISES.map(e =>
 ).join(' ');
 
 // 对话式AI：一次调用同时完成解析+教练点评
+// 现在支持两种模式：
+//  - 训练记录："平板支撑1min 4组" → 解析出数据 + 教练点评
+//  - 自由对话："今天好累不想练" → 纯对话回复，无结构化数据
 export async function coachChat(raw: string): Promise<CoachResponse | null> {
   if (!raw.trim()) return null;
 
@@ -218,7 +278,6 @@ export async function coachChat(raw: string): Promise<CoachResponse | null> {
       if (result) return result;
     } catch (e) {
       console.error('AI对话失败，回退本地:', e);
-      localStorage.setItem('zhenzhen-last-error', `AI对话: ${String(e).slice(0, 100)}`);
     }
   }
 
@@ -231,9 +290,22 @@ export async function coachChat(raw: string): Promise<CoachResponse | null> {
     };
   }
 
-  // 无法解析 → 离线队列
-  addToOfflineQueue(raw);
-  return null;
+  // 无法解析 → AI 离线时的本地通用回复
+  // 即使没识别出动作，也给用户反馈，不要静默失败
+  return {
+    comment: localChatReply(raw),
+  };
+}
+
+// 无 AI 时的本地通用回复
+function localChatReply(raw: string): string {
+  const s = raw.toLowerCase().trim();
+  if (/累|不想|懒得|休息|没劲|困/.test(s)) return '听到了。累了就好好休息，休息也是训练的一部分。今天状态不好不用硬撑。';
+  if (/疼|痛|伤|不舒服/.test(s)) return '注意身体！哪里不舒服先停下来，不要带伤训练。如果持续疼痛建议看医生。';
+  if (/吃|饮食|减肥|减脂|瘦/.test(s)) return '饮食也很重要。训练配合干净饮食效果更好。需要我帮你安排吗？';
+  if (/问|怎么|如何|什么|能不能|可以吗/.test(s)) return '这个问题问得好。你可以在设置里配置 AI Key，我就能更准确地回答你。';
+  if (s.length < 20) return `收到「${raw}」。能具体说说动作、重量和次数吗？比如"跑步30分钟"或"高位下拉40kg 12次"。`;
+  return `听到你说的了。但我不太确定你想记录什么动作。试试这样说：\n"平板支撑 1min 4组"\n"跑步 5km 30分钟 有点累"\n"高位下拉 40kg 12次"`;
 }
 
 async function aiChat(raw: string): Promise<CoachResponse | null> {
@@ -241,7 +313,7 @@ async function aiChat(raw: string): Promise<CoachResponse | null> {
   const history = await getTrainingHistory();
 
   const response = await callDeepSeek(
-    `你是臻臻，一个专业严厉但关心学员的AI健身教练。
+    `你是臻臻，一个专业、口语化、像真人朋友一样的AI健身教练。
 
 学员情况：纯新手，每周${profile.weeklyDays || 3}天，${profile.equipment || '健身房'}，目标"${profile.goal || '养成习惯'}"。
 
@@ -250,54 +322,72 @@ ${history || '暂无'}
 
 动作库：${EXERCISE_LIST}
 
-你的任务：用户说了一段话描述刚做的训练，你需要两件事：
+用户对你说了一句话。你需要判断类型并回应：
+
+【类型A — 训练记录】
+用户在描述刚做的训练动作。你需要：
 1. 解析成结构化数据
-2. 给一句教练点评（20-40字）
-
+2. 给一句教练点评（20-50字，口语化）
 解析规则：
-- 力量训练(weight+reps)、有氧(duration+可能distance)、拉伸(duration)
-- 时间全部转为分钟：1h=60、半小时=30、1小时30分=90
-- RPE从语气推断：太轻松=4 轻松=5 刚好=6 有点累=7 很累=8
+- 力量训练(weight+reps)、自重训练(reps或duration)、有氧(duration+可能distance)、拉伸(duration)
+- 时间全部转为分钟：1h=60、半小时=30、1h30min=90
+- 如果用户说"每组X分钟 Y组"，duration = X × Y（取乘积作为总时长）
+- RPE从语气推断：太轻松=4 轻松=5 刚好=6 有点累=7 很累=8 极限=9
+- 不要因为动作不在动作库里就拒绝，尝试匹配最接近的
 
-点评规则：
-- 口语化，像真人教练说话
-- 力量训练：评价重量和次数是否合理，建议下次调整方向
-- 有氧：评价配速/距离/时长，给鼓励
-- 如果用户说"累"，关心一下并建议调整
-- 对比历史数据，如果有进步就说出来
+【类型B — 自由对话】
+用户在闲聊、提问、抱怨、或者说得模糊。你应该：
+- 像朋友一样自然地回复
+- 如果用户说累/疼/不想练，关心他并给出建议
+- 如果用户问问题，认真回答
+- 如果用户说的不是训练相关，也可以聊
+- 回复控制在30-80字，口语化、有温度
 
-输出JSON格式（只输出JSON，不要其他）：
+输出JSON（只输出JSON，不要其他）：
 {
-  "exerciseId": "动作ID",
-  "weight": null或数字,
-  "reps": null或数字,
-  "distance": null或数字,
-  "duration": null或数字,
+  "type": "training" 或 "chat",
+  "exerciseId": "动作ID（必须用动作库里列出的id，不要自己编）",
+  "exerciseName": "动作中文名",
+  "weight": null或数字(kg),
+  "reps": null或数字(每组次数),
+  "sets": null或数字(组数),
+  "distance": null或数字(km),
+  "duration": null或数字(分钟),
   "rpe": null或1-10,
-  "comment": "教练点评"
-}`,
+  "comment": "你的回复"
+}
+重要：reps是每组次数，sets是组数。如果用户说"十个每组，四组"则reps=10,sets=4。如果用户只说"八组"没提次数，则sets=8,reps=null。`,
     `"${raw}"`,
-    400,
+    500,
   );
 
   const m = response.match(/\{[\s\S]*\}/);
   if (!m) { console.error('AI返回非JSON:', response.slice(0, 150)); return null; }
 
-  const p = JSON.parse(m[0]);
-  if (!p.exerciseId) { console.error('AI无法识别:', raw); return null; }
+  let p: any;
+  try { p = JSON.parse(m[0]); } catch { console.error('AI JSON解析失败:', m[0].slice(0, 150)); return null; }
 
-  const ex = DEFAULT_EXERCISES.find(e => e.id === p.exerciseId);
+  const comment = p.comment || '收到！';
+
+  // 类型B：纯对话，不需要结构化数据
+  if (p.type === 'chat' || !p.exerciseId) {
+    return { comment };
+  }
+
+  // 类型A：训练记录
+  const ex = DEFAULT_EXERCISES.find(e => e.id === p.exerciseId || e.name === p.exerciseId || e.name === p.exerciseName);
   return {
     parsed: {
-      exerciseId: p.exerciseId,
-      exerciseName: ex?.name || p.exerciseId,
-      weight: p.weight,
-      reps: p.reps,
-      distance: p.distance,
-      duration: p.duration,
-      rpe: p.rpe,
+      exerciseId: ex?.id || p.exerciseId || 'unknown',
+      exerciseName: ex?.name || p.exerciseName || p.exerciseId || '未知动作',
+      weight: p.weight || undefined,
+      reps: p.reps || undefined,
+      sets: p.sets || undefined,
+      distance: p.distance || undefined,
+      duration: p.duration || undefined,
+      rpe: p.rpe || undefined,
     },
-    comment: p.comment || '收到！',
+    comment,
   };
 }
 
@@ -321,7 +411,20 @@ export async function parseUserInput(raw: string): Promise<ParsedInput | null> {
 }
 
 function localParse(raw: string): ParsedInput | null {
-  const s = raw.toLowerCase().trim();
+  // 中文数字标准化 → 阿拉伯数字（在量词前）
+  let s = raw.toLowerCase().trim();
+  s = s.replace(/十(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '10$1');
+  s = s.replace(/九(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '9$1');
+  s = s.replace(/八(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '8$1');
+  s = s.replace(/七(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '7$1');
+  s = s.replace(/六(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '6$1');
+  s = s.replace(/五(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '5$1');
+  s = s.replace(/四(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '4$1');
+  s = s.replace(/三(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '3$1');
+  s = s.replace(/两(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '2$1');
+  s = s.replace(/二(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '2$1');
+  s = s.replace(/一(\s*(?:个|组|次|下|分|min|rep|kg|公里|秒|s))/gi, '1$1');
+
   const aliases: Record<string, string> = {
     '高位下拉':'lat-pulldown','下拉':'lat-pulldown','坐姿划船':'seated-row','划船':'seated-row',
     '坐姿推胸':'chest-press','推胸':'chest-press','坐姿推肩':'shoulder-press','推肩':'shoulder-press',
@@ -331,6 +434,11 @@ function localParse(raw: string): ParsedInput | null {
     '骑行':'cycling','骑车':'cycling','自行车':'cycling','跑步机':'treadmill',
     '拉伸':'stretching','拉筋':'stretching','引体向上':'pull-up','引体':'pull-up',
     '俯卧撑':'push-up','自重深蹲':'squat','深蹲':'squat',
+    '平板支撑':'plank','平板':'plank','plank':'plank',
+    '卷腹':'crunch','仰卧起坐':'crunch',
+    '弓步蹲':'lunge','弓步':'lunge','箭步蹲':'lunge',
+    '杠铃卧推':'bench-press','卧推':'bench-press','benchpress':'bench-press',
+    '硬拉':'deadlift','deadlift':'deadlift',
   };
   let id = '';
   for (const [k, v] of Object.entries(aliases)) { if (s.includes(k)) { id = v; break; } }
@@ -340,23 +448,30 @@ function localParse(raw: string): ParsedInput | null {
 
   // 重量
   const w = s.match(/(\d+\.?\d*)\s*(kg|公斤)/);
-  // 次数
-  const r = s.match(/(\d+)\s*(次|个|rep|下)/);
+  // 每组次数 — 支持 "12次" "12个" "12rep" "12下"（"组"不算，组数单独提取）
+  const r = s.match(/(\d+)\s*(次|个|rep|下)(?!\s*组)/);
   // 距离
   const dist = s.match(/(\d+\.?\d*)\s*(km|公里)/);
-  // 时长 - 支持多种格式
+  // 时长 - 支持 "1min" "1分钟" "1分" "30s" "30秒"
   let duration: number | undefined;
   const durMin = s.match(/(\d+)\s*(min|分钟|分)/);
+  const durSec = s.match(/(\d+)\s*(s|秒)/);
   const durHr = s.match(/(\d+\.?\d*)\s*(h|小时|钟头)/);
   const halfHr = /半(小时|钟头|个钟)/.test(s);
   if (durMin) duration = parseInt(durMin[1]);
+  else if (durSec) duration = Math.round(parseInt(durSec[1]) / 60) || 1; // 秒→分钟，最少1分钟
   else if (durHr) duration = Math.round(parseFloat(durHr[1]) * 60);
   else if (halfHr) duration = 30;
-  // 如果只有数字没有单位，且是有氧运动，可能是分钟
-  if (!duration && !w && !r && (ex?.category === 'cardio' || ex?.category === 'stretch')) {
+  // 如果只有数字没有单位，且是有氧/自重/拉伸，可能是分钟
+  if (!duration && !w && !r && (ex?.category === 'cardio' || ex?.category === 'stretch' || ex?.category === 'bodyweight')) {
     const numMatch = s.match(/(\d+)/);
     if (numMatch) duration = parseInt(numMatch[1]);
   }
+
+  // 提取组数: "4组" "共4组" "做4组" "四组"
+  let sets: number | undefined;
+  const setsMatch = s.match(/(\d+)\s*组/);
+  if (setsMatch) sets = parseInt(setsMatch[1]);
 
   // RPE
   let rpe: number | undefined;
@@ -371,6 +486,7 @@ function localParse(raw: string): ParsedInput | null {
     exerciseId: id, exerciseName: ex?.name || id,
     weight: w ? parseFloat(w[1]) : undefined,
     reps: r ? parseInt(r[1]) : undefined,
+    sets,
     distance: dist ? parseFloat(dist[1]) : undefined,
     duration,
     rpe,
@@ -402,7 +518,7 @@ export async function processOfflineQueue(): Promise<number> {
   for (const item of [...queue]) {
     try {
       const result = await aiChat(item.raw);
-      if (result) {
+      if (result?.parsed) {
         const p = result.parsed;
         const session = await db.workoutSessions.orderBy('date').reverse().limit(1).toArray();
         const today = new Date().toISOString().slice(0, 10);
