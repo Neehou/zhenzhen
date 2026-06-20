@@ -1,7 +1,7 @@
 // AI 教练服务 — DeepSeek API
 
 import type { WorkoutSession, DailyPlan, PlannedExercise } from '../types';
-import { db, DEFAULT_EXERCISES, getOrCreateProfile } from '../db/database';
+import { db, DEFAULT_EXERCISES, getOrCreateProfile, generateId } from '../db/database';
 
 const DEEPSEEK_API = 'https://api.deepseek.com/chat/completions';
 const MODEL = 'deepseek-chat';
@@ -16,6 +16,29 @@ export function setApiKey(key: string): void {
 
 export function hasApiKey(): boolean {
   return !!getApiKey();
+}
+
+export function getAIStatus(): 'connected' | 'no-key' | 'error' {
+  if (!getApiKey()) return 'no-key';
+  const lastErr = localStorage.getItem('zhenzhen-last-error');
+  if (lastErr) return 'error';
+  return 'connected';
+}
+
+export function clearAIError(): void {
+  localStorage.removeItem('zhenzhen-last-error');
+}
+
+export async function testConnection(): Promise<boolean> {
+  if (!hasApiKey()) return false;
+  try {
+    await callDeepSeek('回复"OK"', 'test', 10);
+    clearAIError();
+    return true;
+  } catch (e) {
+    localStorage.setItem('zhenzhen-last-error', String(e).slice(0, 200));
+    return false;
+  }
 }
 
 async function callDeepSeek(systemPrompt: string, userMessage: string, maxTokens = 1024): Promise<string> {
@@ -41,10 +64,13 @@ async function callDeepSeek(systemPrompt: string, userMessage: string, maxTokens
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message || `API 请求失败 (${res.status})`);
+    const msg = err.error?.message || `API 请求失败 (${res.status})`;
+    localStorage.setItem('zhenzhen-last-error', msg);
+    throw new Error(msg);
   }
 
   const data = await res.json();
+  clearAIError(); // 通信成功，清除错误
   return data.choices[0].message.content;
 }
 
@@ -179,46 +205,185 @@ const EXERCISE_LIST = DEFAULT_EXERCISES.map(e =>
 
 export async function parseUserInput(raw: string): Promise<ParsedInput | null> {
   if (!raw.trim()) return null;
+
   if (hasApiKey()) {
-    try { return await aiParse(raw); } catch { /* fallback */ }
+    try {
+      const result = await aiParse(raw);
+      if (result) return result;
+    } catch (e) {
+      console.error('AI解析失败，回退本地:', e);
+      localStorage.setItem('zhenzhen-last-error', `AI解析: ${String(e).slice(0, 100)}`);
+    }
   }
-  return localParse(raw);
+
+  // 无AI或无网络 → 本地解析
+  const local = localParse(raw);
+  if (local) return local;
+
+  // 本地也解析不了 → 存离线队列
+  addToOfflineQueue(raw);
+  return null;
 }
 
 async function aiParse(raw: string): Promise<ParsedInput | null> {
   const response = await callDeepSeek(
-    `你是训练记录解析器。动作库：${EXERCISE_LIST}。解析用户输入为JSON。力量提取weight(kg)/reps，有氧提取duration(分钟)/distance(km)。RPE: 太轻松=4 轻松=5 刚好=6 有点累=7 很累=8。只输出JSON。`,
+    `你是臻臻的输入解析器。用户会用自然语言描述训练内容，你需要理解并提取结构化数据。
+
+可用动作：${EXERCISE_LIST}
+
+规则：
+- 识别动作名（用户说的可能不精确，你来匹配最接近的动作ID）
+- 力量训练提取：weight(kg)、reps(次数)
+- 有氧提取：duration(全部转为分钟)、distance(km)
+- 时间转换：1h=60分钟、半小时=30分钟、1小时30分=90分钟、90min=90分钟
+- RPE推断：太轻松=4、轻松=5、刚好=6、有点累=7、很累=8、极限=9-10
+- 如果用户没提到RPE就别猜，设为null
+- 只输出JSON，不要其他文字
+
+示例：
+"跑步10km 1h" → {"exerciseId":"running","distance":10,"duration":60}
+"高位下拉25公斤8次刚好" → {"exerciseId":"lat-pulldown","weight":25,"reps":8,"rpe":6}
+"爬楼机半小时有点累" → {"exerciseId":"stair-climber","duration":30,"rpe":7}
+"引体向上10个" → {"exerciseId":"pull-up","reps":10}`,
     `"${raw}"`,
-    200,
+    300,
   );
+
   const m = response.match(/\{[\s\S]*\}/);
-  if (!m) return null;
+  if (!m) {
+    console.error('AI返回非JSON:', response.slice(0, 100));
+    return null;
+  }
+
   const p = JSON.parse(m[0]);
-  if (!p.exerciseId) return null;
+  if (!p.exerciseId) {
+    console.error('AI无法识别动作:', raw);
+    return null;
+  }
+
   const ex = DEFAULT_EXERCISES.find(e => e.id === p.exerciseId);
-  return { exerciseId: p.exerciseId, exerciseName: ex?.name || p.exerciseId, weight: p.weight, reps: p.reps, distance: p.distance, duration: p.duration, rpe: p.rpe };
+  return {
+    exerciseId: p.exerciseId,
+    exerciseName: ex?.name || p.exerciseId,
+    weight: p.weight,
+    reps: p.reps,
+    distance: p.distance,
+    duration: p.duration,
+    rpe: p.rpe,
+  };
 }
 
 function localParse(raw: string): ParsedInput | null {
+  const s = raw.toLowerCase().trim();
   const aliases: Record<string, string> = {
     '高位下拉':'lat-pulldown','下拉':'lat-pulldown','坐姿划船':'seated-row','划船':'seated-row',
     '坐姿推胸':'chest-press','推胸':'chest-press','坐姿推肩':'shoulder-press','推肩':'shoulder-press',
     '腿举':'leg-press','腿弯举':'leg-curl','腿屈伸':'leg-extension',
     '二头弯举':'bicep-curl','弯举':'bicep-curl','三头下压':'tricep-pushdown',
-    '跑步':'running','爬楼机':'stair-climber','骑行':'cycling','跑步机':'treadmill',
-    '拉伸':'stretching','引体向上':'pull-up','引体':'pull-up','俯卧撑':'push-up','自重深蹲':'squat',
+    '跑步':'running','跑':'running','爬楼机':'stair-climber','爬楼':'stair-climber',
+    '骑行':'cycling','骑车':'cycling','自行车':'cycling','跑步机':'treadmill',
+    '拉伸':'stretching','拉筋':'stretching','引体向上':'pull-up','引体':'pull-up',
+    '俯卧撑':'push-up','自重深蹲':'squat','深蹲':'squat',
   };
   let id = '';
-  for (const [k, v] of Object.entries(aliases)) { if (raw.includes(k)) { id = v; break; } }
+  for (const [k, v] of Object.entries(aliases)) { if (s.includes(k)) { id = v; break; } }
   if (!id) return null;
+
   const ex = DEFAULT_EXERCISES.find(e => e.id === id);
-  const w = raw.match(/(\d+\.?\d*)\s*(kg|公斤)/);
-  const r = raw.match(/(\d+)\s*(次|个)/);
-  const d = raw.match(/(\d+)\s*(min|分钟)/);
+
+  // 重量
+  const w = s.match(/(\d+\.?\d*)\s*(kg|公斤)/);
+  // 次数
+  const r = s.match(/(\d+)\s*(次|个|rep|下)/);
+  // 距离
+  const dist = s.match(/(\d+\.?\d*)\s*(km|公里)/);
+  // 时长 - 支持多种格式
+  let duration: number | undefined;
+  const durMin = s.match(/(\d+)\s*(min|分钟|分)/);
+  const durHr = s.match(/(\d+\.?\d*)\s*(h|小时|钟头)/);
+  const halfHr = /半(小时|钟头|个钟)/.test(s);
+  if (durMin) duration = parseInt(durMin[1]);
+  else if (durHr) duration = Math.round(parseFloat(durHr[1]) * 60);
+  else if (halfHr) duration = 30;
+  // 如果只有数字没有单位，且是有氧运动，可能是分钟
+  if (!duration && !w && !r && (ex?.category === 'cardio' || ex?.category === 'stretch')) {
+    const numMatch = s.match(/(\d+)/);
+    if (numMatch) duration = parseInt(numMatch[1]);
+  }
+
+  // RPE
   let rpe: number | undefined;
-  if (/太轻松|很轻松/.test(raw)) rpe = 4; else if (/轻松/.test(raw)) rpe = 5;
-  else if (/刚好/.test(raw)) rpe = 6; else if (/有点累/.test(raw)) rpe = 7; else if (/很累/.test(raw)) rpe = 8;
-  return { exerciseId: id, exerciseName: ex?.name || id, weight: w ? parseFloat(w[1]) : undefined, reps: r ? parseInt(r[1]) : undefined, duration: d ? parseInt(d[1]) : undefined, rpe };
+  if (/太轻松|很轻松/.test(s)) rpe = 4;
+  else if (/轻松/.test(s)) rpe = 5;
+  else if (/刚好|适中|合适/.test(s)) rpe = 6;
+  else if (/有点累|稍累/.test(s)) rpe = 7;
+  else if (/很累|非常累/.test(s)) rpe = 8;
+  else if (/极限|力竭/.test(s)) rpe = 9;
+
+  return {
+    exerciseId: id, exerciseName: ex?.name || id,
+    weight: w ? parseFloat(w[1]) : undefined,
+    reps: r ? parseInt(r[1]) : undefined,
+    distance: dist ? parseFloat(dist[1]) : undefined,
+    duration,
+    rpe,
+  };
+}
+
+// ==================== 离线队列 ====================
+
+const QUEUE_KEY = 'zhenzhen-offline-queue';
+
+export function addToOfflineQueue(raw: string): void {
+  const queue = getOfflineQueue();
+  queue.push({ raw, time: Date.now() });
+  localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+  console.log('已加入离线队列:', raw.slice(0, 50));
+}
+
+export function getOfflineQueue(): { raw: string; time: number }[] {
+  try {
+    return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+  } catch { return []; }
+}
+
+export async function processOfflineQueue(): Promise<number> {
+  const queue = getOfflineQueue();
+  if (queue.length === 0 || !hasApiKey()) return 0;
+
+  let processed = 0;
+  for (const item of [...queue]) {
+    try {
+      const result = await aiParse(item.raw);
+      if (result) {
+        // 直接存入数据库
+        const session = await db.workoutSessions.orderBy('date').reverse().limit(1).toArray();
+        const today = new Date().toISOString().slice(0, 10);
+        const todaySession = session[0]?.date === today ? session[0] : null;
+
+        if (todaySession) {
+          todaySession.sets.push({
+            id: generateId(),
+            exerciseId: result.exerciseId,
+            weight: result.weight,
+            reps: result.reps,
+            distance: result.distance,
+            duration: result.duration,
+            rpe: result.rpe as any,
+            completed: true,
+            timestamp: Date.now(),
+          });
+          await db.workoutSessions.put(todaySession);
+        }
+        processed++;
+      }
+    } catch (e) {
+      console.error('离线队列处理失败:', item.raw, e);
+    }
+  }
+
+  localStorage.removeItem(QUEUE_KEY);
+  return processed;
 }
 
 // ==================== 生成训练计划 ====================

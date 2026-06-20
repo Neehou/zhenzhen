@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { hasApiKey, setApiKey } from '../services/ai-coach';
+import { hasApiKey, setApiKey, testConnection, getAIStatus } from '../services/ai-coach';
 import { db, getStreak } from '../db/database';
 
 export default function Settings() {
@@ -8,6 +8,9 @@ export default function Settings() {
   const [hasKey, setHasKey] = useState(false);
   const [stats, setStats] = useState({ totalSessions: 0, streak: 0 });
   const [showKey, setShowKey] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<'ok' | 'fail' | null>(null);
+  const [aiStatus, setAiStatus] = useState(getAIStatus());
 
   useEffect(() => {
     setHasKey(hasApiKey());
@@ -28,7 +31,16 @@ export default function Settings() {
     setHasKey(true);
     setSaved(true);
     setApiKeyState('');
+    setAiStatus(getAIStatus());
     setTimeout(() => setSaved(false), 2000);
+  }
+
+  async function handleTestConnection() {
+    setTesting(true); setTestResult(null);
+    const ok = await testConnection();
+    setTestResult(ok ? 'ok' : 'fail');
+    setAiStatus(getAIStatus());
+    setTesting(false);
   }
 
   function handleRemoveKey() {
@@ -79,19 +91,31 @@ export default function Settings() {
         <h2 style={{ fontSize: '15px', fontWeight: 600, margin: '0 0 4px' }}>🤖 AI 教练</h2>
         <p style={{ fontSize: '13px', color: 'var(--color-text3)', marginBottom: '12px', lineHeight: 1.5 }}>
           {hasKey
-            ? '✅ 已配置 DeepSeek API Key，臻臻将为你提供 AI 驱动的个性化指导。'
-            : '填写 DeepSeek API Key 以启用 AI 教练功能。没有 Key 也能用基础功能。'
+            ? (aiStatus === 'connected' ? '✅ AI就绪' : aiStatus === 'error' ? '🔴 连接失败 — 检查Key或网络' : '✅ Key已保存')
+            : '填写 DeepSeek API Key 以启用 AI 教练功能。'
           }
         </p>
 
         {hasKey ? (
-          <button
-            onClick={handleRemoveKey}
-            className="px-3 py-1.5 rounded-lg text-sm"
-            style={{ backgroundColor: 'var(--color-surface2)', color: 'var(--color-red)' }}
-          >
-            移除 Key
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={handleRemoveKey}
+              className="px-3 py-1.5 rounded-lg text-sm"
+              style={{ backgroundColor: 'var(--color-surface2)', color: 'var(--color-red)' }}
+            >
+              移除 Key
+            </button>
+            <button
+              onClick={handleTestConnection}
+              disabled={testing}
+              className="px-3 py-1.5 rounded-lg text-sm font-medium"
+              style={{ backgroundColor: 'var(--color-surface2)', color: 'var(--color-text2)' }}
+            >
+              {testing ? '测试中...' : '测试连接'}
+            </button>
+            {testResult === 'ok' && <span style={{ fontSize: '13px', color: 'var(--color-green)', lineHeight: '30px' }}>✅ 连接成功</span>}
+            {testResult === 'fail' && <span style={{ fontSize: '13px', color: 'var(--color-red)', lineHeight: '30px' }}>❌ 连接失败</span>}
+          </div>
         ) : (
           <>
             <div className="flex gap-2">

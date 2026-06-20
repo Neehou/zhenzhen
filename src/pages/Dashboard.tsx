@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { db, getTodayPlan, getWeeklyStats, DEFAULT_EXERCISES, saveDailyPlan, getOrCreateProfile } from '../db/database';
-import { generateTrainingPlan, parseUserInput, hasApiKey, onboardingMessage, parseOnboardingAnswer, skipComment, setFeedback } from '../services/ai-coach';
+import { generateTrainingPlan, parseUserInput, hasApiKey, onboardingMessage, parseOnboardingAnswer, skipComment, setFeedback, getAIStatus, processOfflineQueue, getOfflineQueue } from '../services/ai-coach';
 import { useTraining } from '../hooks/useTraining';
 import type { DailyPlan, WorkoutSession } from '../types';
 
@@ -76,6 +76,15 @@ export default function Dashboard() {
         } else { setOnboardStep('done'); }
       } catch (e) { console.error('初始化失败', e); setOnboardStep('done'); }
       if (!cancelled) setLoading(false);
+
+      // 处理离线队列
+      if (hasApiKey()) {
+        const queue = getOfflineQueue();
+        if (queue.length > 0) {
+          const count = await processOfflineQueue();
+          if (count > 0) console.log(`离线队列处理完成: ${count}条`);
+        }
+      }
     })();
     return () => { cancelled = true; };
   }, []);
@@ -245,7 +254,9 @@ export default function Dashboard() {
           {!todayTrained && weekly.trainedDays === 0 && new Date().getDay() !== 1 && (
             <span style={{ fontSize: '13px', color: 'var(--color-text3)' }}>{restDayMsg}</span>
           )}
-          {!hasApiKey() && <span style={{ fontSize: '12px', color: 'var(--color-text3)', marginLeft: 'auto' }}>💡 设置填Key</span>}
+          {getAIStatus() === 'no-key' && <span style={{ fontSize: '12px', color: 'var(--color-text3)', marginLeft: 'auto' }}>⚠️ 未配置AI</span>}
+          {getAIStatus() === 'error' && <span style={{ fontSize: '12px', color: 'var(--color-red)', marginLeft: 'auto' }}>🔴 AI连接失败</span>}
+          {getAIStatus() === 'connected' && <span style={{ fontSize: '12px', color: 'var(--color-green)', marginLeft: 'auto' }}>🤖 AI就绪</span>}
         </div>
         {skipMsg && <div className="mt-2 p-2 rounded-lg text-sm" style={{ backgroundColor: 'var(--color-surface2)', color: 'var(--color-text2)' }}>{skipMsg}</div>}
       </div>
