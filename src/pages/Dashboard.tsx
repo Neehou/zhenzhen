@@ -150,8 +150,13 @@ export default function Dashboard() {
       // 引导检查
       if (!profile.onboarded && hasApiKey()) {
         setOnboardStep('chatting');
-        const msg = await onboardingMessage();
-        setOnboardMsg(msg);
+        try {
+          const msg = await onboardingMessage();
+          setOnboardMsg(msg);
+        } catch {
+          // API 调用失败，跳过引导直接进入
+          setOnboardStep('done');
+        }
       } else {
         setOnboardStep('done');
       }
