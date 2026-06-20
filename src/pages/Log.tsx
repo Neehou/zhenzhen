@@ -164,7 +164,7 @@ export default function Log() {
                                   {set.reps && `${set.reps}次 `}
                                   {set.distance && `${set.distance}km `}
                                   {set.duration && `${set.duration}分钟 `}
-                                  {set.rpe && `RPE${set.rpe}`}
+                                  {set.rpe && ` RPE ${set.rpe}`}
                                 </div>
                               </div>
                             );

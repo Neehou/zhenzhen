@@ -69,7 +69,11 @@ export interface UserProfile {
   experienceLevel: 'beginner' | 'intermediate' | 'advanced';
   apiKey?: string;
   createdAt: number;
-  bodyWeight?: number; // latest weight in kg
+  bodyWeight?: number;
+  onboarded?: boolean;
+  weeklyDays?: number;
+  equipment?: string;
+  goal?: string;
 }
 
 // ============ 语音输入解析结果 ============
