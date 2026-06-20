@@ -79,8 +79,8 @@ export default function Settings() {
         <h2 style={{ fontSize: '15px', fontWeight: 600, margin: '0 0 4px' }}>🤖 AI 教练</h2>
         <p style={{ fontSize: '13px', color: 'var(--color-text3)', marginBottom: '12px', lineHeight: 1.5 }}>
           {hasKey
-            ? '✅ 已配置 Anthropic API Key，臻臻将为你提供 AI 驱动的个性化指导。'
-            : '填写 Anthropic API Key 以启用 AI 教练功能。没有 Key 也能用基础功能。'
+            ? '✅ 已配置 DeepSeek API Key，臻臻将为你提供 AI 驱动的个性化指导。'
+            : '填写 DeepSeek API Key 以启用 AI 教练功能。没有 Key 也能用基础功能。'
           }
         </p>
 
@@ -99,7 +99,7 @@ export default function Settings() {
                 type={showKey ? 'text' : 'password'}
                 value={apiKey}
                 onChange={(e) => setApiKeyState(e.target.value)}
-                placeholder="sk-ant-api03-..."
+                placeholder="sk-..."
                 className="flex-1 px-3 py-2 rounded-lg text-sm outline-none"
                 style={{
                   backgroundColor: 'var(--color-surface2)',
@@ -137,12 +137,12 @@ export default function Settings() {
               <br />
               前往{' '}
               <a
-                href="https://console.anthropic.com/"
+                href="https://platform.deepseek.com/"
                 target="_blank"
                 rel="noopener"
                 style={{ color: 'var(--color-blue)', textDecoration: 'underline' }}
               >
-                console.anthropic.com
+                platform.deepseek.com
               </a>
               {' '}获取 API Key。
             </p>
