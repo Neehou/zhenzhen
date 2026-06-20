@@ -1,22 +1,27 @@
 import { useState, useEffect, useRef } from 'react';
 import { db, getTodayPlan, getStreak, DEFAULT_EXERCISES, saveDailyPlan, getOrCreateProfile } from '../db/database';
-import { generateTrainingPlan, parseUserInput, hasApiKey, onboardingMessage, parseOnboardingAnswer, skipComment } from '../services/ai-coach';
+import { generateTrainingPlan, parseUserInput, hasApiKey, onboardingMessage, parseOnboardingAnswer, skipComment, setFeedback } from '../services/ai-coach';
 import { useTraining } from '../hooks/useTraining';
 import type { DailyPlan, WorkoutSession, TrainingSet } from '../types';
 
 // ═══════════════════════════════════════════
 // 全屏休息组件
 // ═══════════════════════════════════════════
-function RestOverlay({ seconds, nextExercise, onSkip }: { seconds: number; nextExercise: string; onSkip: () => void }) {
+function RestOverlay({ seconds, nextExercise, comment, onSkip }: { seconds: number; nextExercise: string; comment: string; onSkip: () => void }) {
   return (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center" style={{ backgroundColor: '#0a0a0a' }}>
+    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center px-8" style={{ backgroundColor: '#0a0a0a' }}>
       <p style={{ fontSize: '64px', margin: 0 }}>⏱️</p>
-      <p style={{ fontSize: '72px', fontWeight: 800, margin: '16px 0', fontVariantNumeric: 'tabular-nums', letterSpacing: '-2px' }}>
+      <p style={{ fontSize: '72px', fontWeight: 800, margin: '12px 0', fontVariantNumeric: 'tabular-nums', letterSpacing: '-2px' }}>
         {seconds}s
       </p>
       {nextExercise && (
-        <p style={{ fontSize: '16px', color: 'var(--color-text2)', margin: '0 0 32px' }}>
+        <p style={{ fontSize: '16px', color: 'var(--color-text2)', margin: '0 0 8px' }}>
           下一组：{nextExercise}
+        </p>
+      )}
+      {comment && (
+        <p style={{ fontSize: '15px', color: 'var(--color-accent)', margin: '0 0 24px', textAlign: 'center', lineHeight: 1.6 }}>
+          {comment}
         </p>
       )}
       <button
@@ -26,6 +31,19 @@ function RestOverlay({ seconds, nextExercise, onSkip }: { seconds: number; nextE
       >
         跳过休息
       </button>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════
+// 统计小组件
+// ═══════════════════════════════════════════
+function StatBox({ label, value, unit }: { label: string; value: string; unit: string }) {
+  return (
+    <div className="rounded-xl p-3" style={{ backgroundColor: 'var(--color-surface2)' }}>
+      <p style={{ fontSize: '11px', color: 'var(--color-text3)', margin: '0 0 2px' }}>{label}</p>
+      <span style={{ fontSize: '22px', fontWeight: 700, color: 'var(--color-accent)' }}>{value}</span>
+      <span style={{ fontSize: '13px', color: 'var(--color-text3)', marginLeft: '4px' }}>{unit}</span>
     </div>
   );
 }
@@ -53,7 +71,7 @@ function RecordPanel({
 
   return (
     <div className="fixed inset-0 z-40 flex items-end justify-center" style={{ backgroundColor: 'rgba(0,0,0,0.6)' }} onClick={onClose}>
-      <div className="w-full max-w-lg rounded-t-2xl px-5 pt-5 pb-8 slide-up" style={{ backgroundColor: 'var(--color-surface)' }} onClick={e => e.stopPropagation()}>
+      <div className="w-full max-w-lg rounded-t-2xl px-5 pt-5 pb-24 slide-up" style={{ backgroundColor: 'var(--color-surface)' }} onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h3 style={{ fontSize: '18px', fontWeight: 700 }}>{exerciseName}</h3>
           <button onClick={onClose} style={{ fontSize: '20px', color: 'var(--color-text3)' }}>✕</button>
@@ -127,7 +145,8 @@ export default function Dashboard() {
   const [panelExercise, setPanelExercise] = useState<{ id: string; name: string; category: string } | null>(null);
   const [currentExIndex, setCurrentExIndex] = useState(0);
   const [skipMsg, setSkipMsg] = useState('');
-  const [showRest, setShowRest] = useState(false); // 控制全屏休息
+  const [showRest, setShowRest] = useState(false);
+  const [setComment, setSetComment] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
 
   // ─── 引导状态 ───
@@ -217,11 +236,20 @@ export default function Dashboard() {
     setPanelExercise({ id: exerciseId, name: ex.name, category: ex.category });
   }
 
-  function handlePanelRecord(data: { weight?: number; reps?: number; duration?: number; distance?: number; rpe?: number }) {
+  async function handlePanelRecord(data: { weight?: number; reps?: number; duration?: number; distance?: number; rpe?: number }) {
     if (!panelExercise) return;
     addSet({ exerciseId: panelExercise.id, ...data });
     setPanelExercise(null);
     setShowRest(true);
+    // 逐组AI微评
+    if (hasApiKey()) {
+      try {
+        const comment = await setFeedback(panelExercise.name, data.weight, data.reps, data.duration, data.rpe);
+        setSetComment(comment);
+      } catch { setSetComment(''); }
+    } else {
+      setSetComment(data.rpe && data.rpe <= 5 ? '太轻松了，下次加重量。' : '收到，继续加油！');
+    }
   }
 
   // ─── 跳过当前动作 ───
@@ -251,6 +279,15 @@ export default function Dashboard() {
         addSet({ exerciseId: parsed.exerciseId, weight: parsed.weight, reps: parsed.reps, duration: parsed.duration, distance: parsed.distance, rpe: parsed.rpe });
         setTextInput('');
         setShowRest(true);
+        // 逐组AI微评
+        if (hasApiKey()) {
+          try {
+            const comment = await setFeedback(parsed.exerciseName, parsed.weight, parsed.reps, parsed.duration, parsed.rpe);
+            setSetComment(comment);
+          } catch { setSetComment(''); }
+        } else {
+          setSetComment(parsed.rpe && parsed.rpe <= 5 ? '太轻松了，下次加重量。' : '收到，继续加油！');
+        }
       } else {
         setParseError('没识别到动作。试试"高位下拉25公斤8次刚好"');
       }
@@ -272,7 +309,7 @@ export default function Dashboard() {
 
   // ─── 全屏休息 ───
   if (showRest && isResting) {
-    return <RestOverlay seconds={restSeconds} nextExercise={restNextName} onSkip={() => { skipRest(); setShowRest(false); }} />;
+    return <RestOverlay seconds={restSeconds} nextExercise={restNextName} comment={setComment} onSkip={() => { skipRest(); setShowRest(false); setSetComment(''); }} />;
   }
 
   // 休息结束但还没关屏
@@ -328,21 +365,60 @@ export default function Dashboard() {
 
   // ─── 完成 ───
   if (feedback) {
+    // 计算统计数据
+    const strSets = sets.filter(s => {
+      const e = DEFAULT_EXERCISES.find(x => x.id === s.exerciseId);
+      return e?.category === 'strength' || e?.category === 'bodyweight';
+    });
+    const totalVolume = strSets.reduce((sum, s) => sum + (s.weight || 0) * (s.reps || 0), 0);
+    const totalDuration = sets.reduce((sum, s) => sum + (s.duration || 0), 0);
+    const totalDistance = sets.reduce((sum, s) => sum + (s.distance || 0), 0);
+    const workoutDuration = currentSession?.endTime && currentSession?.startTime
+      ? Math.round((currentSession.endTime - currentSession.startTime) / 60000)
+      : null;
+    const exercisesDone = [...new Set(sets.map(s => {
+      const e = DEFAULT_EXERCISES.find(x => x.id === s.exerciseId);
+      return e?.name || s.exerciseId;
+    }))];
+
     return (
-      <div className="flex flex-col items-center justify-center h-full px-5 pb-24 safe-top">
-        <div className="text-center mb-8">
-          <p style={{ fontSize: '48px', margin: 0 }}>✅</p>
-          <h2 style={{ fontSize: '22px', fontWeight: 700, margin: '12px 0 4px' }}>训练完成</h2>
-          <p style={{ fontSize: '14px', color: 'var(--color-text3)' }}>{sets.length} 组已完成</p>
+      <div className="flex flex-col h-full overflow-y-auto px-5 pb-24 safe-top">
+        <div className="text-center pt-6 pb-4">
+          <p style={{ fontSize: '48px', margin: 0 }}>🏁</p>
+          <h2 style={{ fontSize: '24px', fontWeight: 800, margin: '8px 0 0', letterSpacing: '-0.5px' }}>训练完成</h2>
         </div>
-        <div className="w-full rounded-2xl p-5 mb-6" style={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
-          <h3 className="font-semibold mb-2" style={{ fontSize: '15px' }}>💬 臻臻点评</h3>
-          <p style={{ fontSize: '14px', lineHeight: 1.7, color: 'var(--color-text2)', whiteSpace: 'pre-wrap' }}>{feedback}</p>
+
+        {/* 数据统计 */}
+        <div className="rounded-2xl p-4 mb-4" style={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
+          <h3 style={{ fontSize: '14px', fontWeight: 600, margin: '0 0 12px', color: 'var(--color-text2)' }}>📊 今日数据</h3>
+          <div className="grid grid-cols-2 gap-3">
+            <StatBox label="总组数" value={`${sets.length}`} unit="组" />
+            <StatBox label="力量组" value={`${strSets.length}`} unit="组" />
+            {totalVolume > 0 && <StatBox label="总容量" value={`${totalVolume.toLocaleString()}`} unit="kg" />}
+            {totalDuration > 0 && <StatBox label="有氧时长" value={`${totalDuration}`} unit="分钟" />}
+            {totalDistance > 0 && <StatBox label="有氧距离" value={`${totalDistance}`} unit="km" />}
+            {workoutDuration && <StatBox label="训练用时" value={`${workoutDuration}`} unit="分钟" />}
+          </div>
+          <div className="mt-3 pt-3" style={{ borderTop: '1px solid var(--color-border)' }}>
+            <span style={{ fontSize: '13px', color: 'var(--color-text3)' }}>
+              完成了：{exercisesDone.join(' · ')}
+            </span>
+          </div>
         </div>
-        <button onClick={() => window.location.reload()} className="w-full py-3.5 rounded-xl text-base font-semibold" style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>返回首页</button>
+
+        {/* AI 总评 */}
+        <div className="rounded-2xl p-4 mb-4" style={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
+          <h3 style={{ fontSize: '14px', fontWeight: 600, margin: '0 0 8px', color: 'var(--color-text2)' }}>💬 臻臻总评</h3>
+          <p style={{ fontSize: '14px', lineHeight: 1.8, color: 'var(--color-text2)', whiteSpace: 'pre-wrap', margin: 0 }}>{feedback}</p>
+        </div>
+
+        <button onClick={() => window.location.reload()} className="w-full py-3.5 rounded-xl text-base font-semibold" style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>
+          返回首页
+        </button>
       </div>
     );
   }
+
 
   // ═══════════════════════ 主界面 ═══════════════════════
   return (

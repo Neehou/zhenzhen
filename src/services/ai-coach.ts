@@ -368,6 +368,29 @@ export async function skipComment(exerciseName: string, exerciseCategory: string
   } catch { return `跳过了${exerciseName}。`; }
 }
 
+// ==================== 逐组微评 ====================
+
+export async function setFeedback(
+  exerciseName: string, weight?: number, reps?: number, duration?: number, rpe?: number,
+): Promise<string> {
+  if (!hasApiKey()) {
+    if (rpe && rpe <= 5) return '这组很轻松，下次可以考虑加一点重量。';
+    if (rpe && rpe >= 8) return '这组很有挑战性，注意动作不要变形。';
+    return '收到，继续加油！';
+  }
+  try {
+    const rpeLabel = rpe ? ['','','','','太轻松','轻松','刚好','有点累','很累','极限','极限'][rpe] : '未标记';
+    const detail = [weight && `${weight}kg`, reps && `${reps}次`, duration && `${duration}分钟`].filter(Boolean).join(' ');
+    return await callDeepSeek(
+      '你是臻臻。学员刚做完一组训练。给1句话微评（15字以内）：如果RPE太轻松建议加重量，太累提醒注意动作，刚好就鼓励。口语化。',
+      `${exerciseName}: ${detail} 感觉${rpeLabel}`,
+      80,
+    );
+  } catch {
+    return rpe && rpe <= 5 ? '太轻松了，下次加重量。' : '收到！';
+  }
+}
+
 // ==================== 周报 ====================
 
 export async function generateWeeklyReport(sessions: WorkoutSession[]): Promise<string> {

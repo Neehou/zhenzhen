@@ -1,9 +1,9 @@
 import { useLocation, useNavigate } from 'react-router-dom';
 
 const NAV_ITEMS = [
-  { path: '/', label: '训练', icon: '🏋️' },
-  { path: '/log', label: '日志', icon: '📊' },
-  { path: '/settings', label: '设置', icon: '⚙️' },
+  { path: '/', label: '训练' },
+  { path: '/log', label: '日志' },
+  { path: '/settings', label: '设置' },
 ];
 
 export default function Navigation() {
@@ -16,7 +16,7 @@ export default function Navigation() {
       style={{
         backgroundColor: 'var(--color-surface)',
         borderTop: '1px solid var(--color-border)',
-        height: '64px',
+        height: '56px',
       }}
     >
       {NAV_ITEMS.map(item => {
@@ -25,11 +25,15 @@ export default function Navigation() {
           <button
             key={item.path}
             onClick={() => navigate(item.path)}
-            className="flex flex-col items-center justify-center gap-0.5 w-16 h-full transition-colors"
-            style={{ color: isActive ? 'var(--color-accent)' : 'var(--color-text3)' }}
+            className="flex items-center justify-center w-16 h-full transition-colors"
+            style={{
+              color: isActive ? 'var(--color-accent)' : 'var(--color-text3)',
+              fontSize: '16px',
+              fontWeight: isActive ? 700 : 500,
+              letterSpacing: '2px',
+            }}
           >
-            <span className="text-xl">{item.icon}</span>
-            <span className="text-xs font-medium">{item.label}</span>
+            {item.label}
           </button>
         );
       })}
