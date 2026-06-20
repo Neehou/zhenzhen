@@ -1,8 +1,7 @@
 import { useLocation, useNavigate } from 'react-router-dom';
 
 const NAV_ITEMS = [
-  { path: '/', label: '今日', icon: '📋' },
-  { path: '/training', label: '训练', icon: '🏋️' },
+  { path: '/', label: '训练', icon: '🏋️' },
   { path: '/log', label: '日志', icon: '📊' },
   { path: '/settings', label: '设置', icon: '⚙️' },
 ];

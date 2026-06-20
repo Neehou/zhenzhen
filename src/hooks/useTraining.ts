@@ -10,44 +10,56 @@ export function useTraining() {
   const [restSeconds, setRestSeconds] = useState(0);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [activeExerciseId, setActiveExerciseId] = useState<string | null>(null);
 
   // 开始训练
-  const startWorkout = useCallback(() => {
+  const startWorkout = useCallback((type: 'planned' | 'freestyle' = 'freestyle') => {
     const session: WorkoutSession = {
       id: generateId(),
       date: new Date().toISOString().slice(0, 10),
       startTime: Date.now(),
       sets: [],
-      type: 'freestyle',
+      type,
     };
     setCurrentSession(session);
     setSets([]);
     setFeedback(null);
+    setActiveExerciseId(null);
   }, []);
 
-  // 添加一组
-  const addSet = useCallback((parsed: ParsedTrainingInput) => {
-    const exercise = DEFAULT_EXERCISES.find(
-      e => e.name === parsed.exerciseName || e.id === parsed.exerciseName
-    );
+  // 添加一组（可传 exerciseId 跳过动作名解析）
+  const addSet = useCallback((
+    input: ParsedTrainingInput | { exerciseId: string; weight?: number; reps?: number; distance?: number; duration?: number; rpe?: number },
+  ) => {
+    let exerciseId: string;
+
+    if ('exerciseId' in input && input.exerciseId) {
+      // 计划动作直接传 ID
+      exerciseId = input.exerciseId;
+    } else {
+      // 语音/文字解析
+      const parsed = input as ParsedTrainingInput;
+      const exercise = DEFAULT_EXERCISES.find(
+        e => e.name === parsed.exerciseName || e.id === parsed.exerciseName
+      );
+      exerciseId = exercise?.id || parsed.exerciseName;
+    }
 
     const newSet: TrainingSet = {
       id: generateId(),
-      exerciseId: exercise?.id || parsed.exerciseName,
-      weight: parsed.weight,
-      reps: parsed.reps,
-      distance: parsed.distance,
-      duration: parsed.duration,
-      rpe: parsed.rpe,
+      exerciseId,
+      weight: input.weight,
+      reps: input.reps,
+      distance: input.distance,
+      duration: input.duration,
+      rpe: input.rpe as TrainingSet['rpe'],
       completed: true,
       timestamp: Date.now(),
     };
 
     setSets(prev => [...prev, newSet]);
-
-    // 开始组间休息计时
     setIsResting(true);
-    setRestSeconds(90); // 默认90秒
+    setRestSeconds(90);
   }, []);
 
   // 倒计时
@@ -67,18 +79,15 @@ export function useTraining() {
     return () => clearInterval(timer);
   }, [isResting, restSeconds]);
 
-  // 提前结束休息
   const skipRest = useCallback(() => {
     setIsResting(false);
     setRestSeconds(0);
   }, []);
 
-  // 删除一组
   const removeSet = useCallback((setId: string) => {
     setSets(prev => prev.filter(s => s.id !== setId));
   }, []);
 
-  // 更新RPE
   const updateRPE = useCallback((setId: string, rpe: number) => {
     setSets(prev =>
       prev.map(s => (s.id === setId ? { ...s, rpe: rpe as TrainingSet['rpe'] } : s))
@@ -95,10 +104,8 @@ export function useTraining() {
       sets,
     };
 
-    // 存入数据库
     await db.workoutSessions.put(session);
 
-    // AI 分析
     setIsAnalyzing(true);
     try {
       const recentSessions = await db.workoutSessions
@@ -108,7 +115,6 @@ export function useTraining() {
         .toArray();
       const analysis = await analyzeWorkout(session, recentSessions);
 
-      // 更新 session 加入 AI 反馈
       const updatedSession = { ...session, aiFeedback: analysis };
       await db.workoutSessions.put(updatedSession);
       setFeedback(analysis);
@@ -120,6 +126,7 @@ export function useTraining() {
 
     setCurrentSession(null);
     setSets([]);
+    setActiveExerciseId(null);
   }, [currentSession, sets]);
 
   // 放弃训练
@@ -132,6 +139,7 @@ export function useTraining() {
     setIsResting(false);
     setRestSeconds(0);
     setFeedback(null);
+    setActiveExerciseId(null);
   }, [sets]);
 
   return {
@@ -141,6 +149,8 @@ export function useTraining() {
     restSeconds,
     feedback,
     isAnalyzing,
+    activeExerciseId,
+    setActiveExerciseId,
     startWorkout,
     addSet,
     removeSet,
