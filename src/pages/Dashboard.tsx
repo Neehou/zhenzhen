@@ -138,30 +138,36 @@ export default function Dashboard() {
 
   // ─── 初始化 ───
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       setLoading(true);
-      const [s, p, sessions, profile] = await Promise.all([
-        getStreak(), getTodayPlan(),
-        db.workoutSessions.orderBy('date').reverse().limit(1).toArray(),
-        getOrCreateProfile(),
-      ]);
-      setStreak(s); setPlan(p || null); setLastSession(sessions[0] || null);
+      try {
+        const [s, p, sessions, profile] = await Promise.all([
+          getStreak(), getTodayPlan(),
+          db.workoutSessions.orderBy('date').reverse().limit(1).toArray(),
+          getOrCreateProfile(),
+        ]);
+        if (cancelled) return;
+        setStreak(s); setPlan(p || null); setLastSession(sessions[0] || null);
 
-      // 引导检查
-      if (!profile.onboarded && hasApiKey()) {
-        setOnboardStep('chatting');
-        try {
-          const msg = await onboardingMessage();
-          setOnboardMsg(msg);
-        } catch {
-          // API 调用失败，跳过引导直接进入
+        if (!profile.onboarded && hasApiKey()) {
+          setOnboardStep('chatting');
+          try {
+            const msg = await onboardingMessage();
+            if (!cancelled) { setOnboardMsg(msg); }
+          } catch {
+            setOnboardStep('done');
+          }
+        } else {
           setOnboardStep('done');
         }
-      } else {
+      } catch (e) {
+        console.error('初始化失败', e);
         setOnboardStep('done');
       }
-      setLoading(false);
+      if (!cancelled) setLoading(false);
     })();
+    return () => { cancelled = true; };
   }, []);
 
   // ─── 引导对话 ───
