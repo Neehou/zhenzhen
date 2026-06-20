@@ -187,7 +187,7 @@ ${!profile.goal ? '- 目标（增力/减脂/养成习惯/学动作）' : ''}
   return JSON.parse(m[0]);
 }
 
-// ==================== AI 输入解析 ====================
+// ==================== AI 对话式输入（解析+点评一次完成） ====================
 
 export interface ParsedInput {
   exerciseId: string;
@@ -199,78 +199,125 @@ export interface ParsedInput {
   rpe?: number;
 }
 
+export interface CoachResponse {
+  parsed: ParsedInput;
+  comment: string;
+}
+
 const EXERCISE_LIST = DEFAULT_EXERCISES.map(e =>
   `"${e.id}" (${e.name},${e.category})`
 ).join(' ');
 
-export async function parseUserInput(raw: string): Promise<ParsedInput | null> {
+// 对话式AI：一次调用同时完成解析+教练点评
+export async function coachChat(raw: string): Promise<CoachResponse | null> {
   if (!raw.trim()) return null;
 
   if (hasApiKey()) {
     try {
-      const result = await aiParse(raw);
+      const result = await aiChat(raw);
       if (result) return result;
     } catch (e) {
-      console.error('AI解析失败，回退本地:', e);
-      localStorage.setItem('zhenzhen-last-error', `AI解析: ${String(e).slice(0, 100)}`);
+      console.error('AI对话失败，回退本地:', e);
+      localStorage.setItem('zhenzhen-last-error', `AI对话: ${String(e).slice(0, 100)}`);
     }
   }
 
-  // 无AI或无网络 → 本地解析
+  // 回退：本地解析
   const local = localParse(raw);
-  if (local) return local;
+  if (local) {
+    return {
+      parsed: local,
+      comment: localComment(local),
+    };
+  }
 
-  // 本地也解析不了 → 存离线队列
+  // 无法解析 → 离线队列
   addToOfflineQueue(raw);
   return null;
 }
 
-async function aiParse(raw: string): Promise<ParsedInput | null> {
+async function aiChat(raw: string): Promise<CoachResponse | null> {
+  const profile = await getOrCreateProfile();
+  const history = await getTrainingHistory();
+
   const response = await callDeepSeek(
-    `你是臻臻的输入解析器。用户会用自然语言描述训练内容，你需要理解并提取结构化数据。
+    `你是臻臻，一个专业严厉但关心学员的AI健身教练。
 
-可用动作：${EXERCISE_LIST}
+学员情况：纯新手，每周${profile.weeklyDays || 3}天，${profile.equipment || '健身房'}，目标"${profile.goal || '养成习惯'}"。
 
-规则：
-- 识别动作名（用户说的可能不精确，你来匹配最接近的动作ID）
-- 力量训练提取：weight(kg)、reps(次数)
-- 有氧提取：duration(全部转为分钟)、distance(km)
-- 时间转换：1h=60分钟、半小时=30分钟、1小时30分=90分钟、90min=90分钟
-- RPE推断：太轻松=4、轻松=5、刚好=6、有点累=7、很累=8、极限=9-10
-- 如果用户没提到RPE就别猜，设为null
-- 只输出JSON，不要其他文字
+训练历史：
+${history || '暂无'}
 
-示例：
-"跑步10km 1h" → {"exerciseId":"running","distance":10,"duration":60}
-"高位下拉25公斤8次刚好" → {"exerciseId":"lat-pulldown","weight":25,"reps":8,"rpe":6}
-"爬楼机半小时有点累" → {"exerciseId":"stair-climber","duration":30,"rpe":7}
-"引体向上10个" → {"exerciseId":"pull-up","reps":10}`,
+动作库：${EXERCISE_LIST}
+
+你的任务：用户说了一段话描述刚做的训练，你需要两件事：
+1. 解析成结构化数据
+2. 给一句教练点评（20-40字）
+
+解析规则：
+- 力量训练(weight+reps)、有氧(duration+可能distance)、拉伸(duration)
+- 时间全部转为分钟：1h=60、半小时=30、1小时30分=90
+- RPE从语气推断：太轻松=4 轻松=5 刚好=6 有点累=7 很累=8
+
+点评规则：
+- 口语化，像真人教练说话
+- 力量训练：评价重量和次数是否合理，建议下次调整方向
+- 有氧：评价配速/距离/时长，给鼓励
+- 如果用户说"累"，关心一下并建议调整
+- 对比历史数据，如果有进步就说出来
+
+输出JSON格式（只输出JSON，不要其他）：
+{
+  "exerciseId": "动作ID",
+  "weight": null或数字,
+  "reps": null或数字,
+  "distance": null或数字,
+  "duration": null或数字,
+  "rpe": null或1-10,
+  "comment": "教练点评"
+}`,
     `"${raw}"`,
-    300,
+    400,
   );
 
   const m = response.match(/\{[\s\S]*\}/);
-  if (!m) {
-    console.error('AI返回非JSON:', response.slice(0, 100));
-    return null;
-  }
+  if (!m) { console.error('AI返回非JSON:', response.slice(0, 150)); return null; }
 
   const p = JSON.parse(m[0]);
-  if (!p.exerciseId) {
-    console.error('AI无法识别动作:', raw);
-    return null;
-  }
+  if (!p.exerciseId) { console.error('AI无法识别:', raw); return null; }
 
   const ex = DEFAULT_EXERCISES.find(e => e.id === p.exerciseId);
   return {
-    exerciseId: p.exerciseId,
-    exerciseName: ex?.name || p.exerciseId,
-    weight: p.weight,
-    reps: p.reps,
-    distance: p.distance,
-    duration: p.duration,
-    rpe: p.rpe,
+    parsed: {
+      exerciseId: p.exerciseId,
+      exerciseName: ex?.name || p.exerciseId,
+      weight: p.weight,
+      reps: p.reps,
+      distance: p.distance,
+      duration: p.duration,
+      rpe: p.rpe,
+    },
+    comment: p.comment || '收到！',
   };
+}
+
+function localComment(input: ParsedInput): string {
+  const parts: string[] = [];
+  if (input.weight) parts.push(`${input.weight}kg`);
+  if (input.reps) parts.push(`${input.reps}次`);
+  if (input.distance) parts.push(`${input.distance}km`);
+  if (input.duration) parts.push(`${input.duration}分钟`);
+  const detail = parts.join(' ');
+
+  if (input.rpe && input.rpe <= 5) return `${input.exerciseName} ${detail}，太轻松了，下次加重量。`;
+  if (input.rpe && input.rpe >= 8) return `${input.exerciseName} ${detail}，强度到位，注意动作质量。`;
+  return `${input.exerciseName} ${detail}，收到！`;
+}
+
+// 兼容旧接口
+export async function parseUserInput(raw: string): Promise<ParsedInput | null> {
+  const result = await coachChat(raw);
+  return result?.parsed || null;
 }
 
 function localParse(raw: string): ParsedInput | null {
@@ -354,9 +401,9 @@ export async function processOfflineQueue(): Promise<number> {
   let processed = 0;
   for (const item of [...queue]) {
     try {
-      const result = await aiParse(item.raw);
+      const result = await aiChat(item.raw);
       if (result) {
-        // 直接存入数据库
+        const p = result.parsed;
         const session = await db.workoutSessions.orderBy('date').reverse().limit(1).toArray();
         const today = new Date().toISOString().slice(0, 10);
         const todaySession = session[0]?.date === today ? session[0] : null;
@@ -364,12 +411,12 @@ export async function processOfflineQueue(): Promise<number> {
         if (todaySession) {
           todaySession.sets.push({
             id: generateId(),
-            exerciseId: result.exerciseId,
-            weight: result.weight,
-            reps: result.reps,
-            distance: result.distance,
-            duration: result.duration,
-            rpe: result.rpe as any,
+            exerciseId: p.exerciseId,
+            weight: p.weight,
+            reps: p.reps,
+            distance: p.distance,
+            duration: p.duration,
+            rpe: p.rpe as any,
             completed: true,
             timestamp: Date.now(),
           });

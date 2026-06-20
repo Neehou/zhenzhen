@@ -1,23 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
 import { db, getTodayPlan, getWeeklyStats, DEFAULT_EXERCISES, saveDailyPlan, getOrCreateProfile } from '../db/database';
-import { generateTrainingPlan, parseUserInput, hasApiKey, onboardingMessage, parseOnboardingAnswer, skipComment, setFeedback, getAIStatus, processOfflineQueue, getOfflineQueue } from '../services/ai-coach';
+import { generateTrainingPlan, coachChat, hasApiKey, onboardingMessage, parseOnboardingAnswer, skipComment, getAIStatus, processOfflineQueue, getOfflineQueue } from '../services/ai-coach';
 import { useTraining } from '../hooks/useTraining';
 import type { DailyPlan, WorkoutSession } from '../types';
 
-// ═══════════════════════ 全屏休息 ═══════════════════════
-function RestOverlay({ seconds, nextExercise, comment, onSkip }: { seconds: number; nextExercise: string; comment: string; onSkip: () => void }) {
-  return (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center px-8" style={{ backgroundColor: '#0a0a0a' }}>
-      <p style={{ fontSize: '64px', margin: 0 }}>⏱️</p>
-      <p style={{ fontSize: '72px', fontWeight: 800, margin: '12px 0', fontVariantNumeric: 'tabular-nums', letterSpacing: '-2px' }}>{seconds}s</p>
-      {nextExercise && <p style={{ fontSize: '16px', color: 'var(--color-text2)', margin: '0 0 8px' }}>下一组：{nextExercise}</p>}
-      {comment && <p style={{ fontSize: '15px', color: 'var(--color-accent)', margin: '0 0 24px', textAlign: 'center', lineHeight: 1.6 }}>{comment}</p>}
-      <button onClick={onSkip} className="px-8 py-3 rounded-xl text-lg font-medium" style={{ backgroundColor: 'var(--color-surface2)', color: 'var(--color-text2)' }}>跳过休息</button>
-    </div>
-  );
-}
-
-// ═══════════════════════ 统计小格 ═══════════════════════
+// ═══════════════════════ 统计 ═══════════════════════
 function StatBox({ label, value, unit }: { label: string; value: string; unit: string }) {
   return (
     <div className="rounded-xl p-3" style={{ backgroundColor: 'var(--color-surface2)' }}>
@@ -35,23 +22,21 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [lastSession, setLastSession] = useState<WorkoutSession | null>(null);
-  const { currentSession, sets, isResting, restSeconds, feedback, isAnalyzing,
-    startWorkout, addSet, skipRest, finishWorkout, cancelWorkout } = useTraining();
+  const { currentSession, sets, feedback, isAnalyzing,
+    startWorkout, addSet, finishWorkout, cancelWorkout } = useTraining();
   const [textInput, setTextInput] = useState('');
-  const [parsing, setParsing] = useState(false);
+  const [awaitingAI, setAwaitingAI] = useState(false);
   const [parseError, setParseError] = useState('');
   const [currentExIndex, setCurrentExIndex] = useState(0);
   const [skipMsg, setSkipMsg] = useState('');
-  const [showRest, setShowRest] = useState(false);
-  const [setComment, setSetComment] = useState('');
+  const [aiChats, setAiChats] = useState<{ role: 'user' | 'coach'; text: string; time: number }[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // ─── 行内输入状态 ───
+  // 行内输入
   const [inlineWeight, setInlineWeight] = useState<Record<string, string>>({});
   const [inlineReps, setInlineReps] = useState<Record<string, string>>({});
   const [inlineDuration, setInlineDuration] = useState<Record<string, string>>({});
 
-  // ─── 引导 ───
   const [onboardStep, setOnboardStep] = useState<'checking' | 'chatting' | 'done'>('checking');
   const [onboardMsg, setOnboardMsg] = useState('');
   const [onboardInput, setOnboardInput] = useState('');
@@ -74,22 +59,28 @@ export default function Dashboard() {
           try { const msg = await onboardingMessage(); if (!cancelled) setOnboardMsg(msg); }
           catch { setOnboardStep('done'); }
         } else { setOnboardStep('done'); }
+
+        // 没有今日计划 → 自动生成
+        if (!p && !cancelled) {
+          try {
+            const recent = await db.workoutSessions.orderBy('date').reverse().limit(10).toArray();
+            const newPlan = await generateTrainingPlan(recent, undefined);
+            if (!cancelled) { setPlan(newPlan); await saveDailyPlan(newPlan); }
+          } catch { /* 自动生成失败 */ }
+        }
       } catch (e) { console.error('初始化失败', e); setOnboardStep('done'); }
       if (!cancelled) setLoading(false);
 
       // 处理离线队列
       if (hasApiKey()) {
         const queue = getOfflineQueue();
-        if (queue.length > 0) {
-          const count = await processOfflineQueue();
-          if (count > 0) console.log(`离线队列处理完成: ${count}条`);
-        }
+        if (queue.length > 0) processOfflineQueue();
       }
     })();
     return () => { cancelled = true; };
   }, []);
 
-  // ─── 引导对话 ───
+  // 引导对话
   async function handleOnboardSend() {
     if (!onboardInput.trim() || onboardWaiting) return;
     setOnboardWaiting(true);
@@ -106,7 +97,7 @@ export default function Dashboard() {
     setOnboardWaiting(false);
   }
 
-  // ─── 生成计划 ───
+  // 生成计划
   async function handleGeneratePlan() {
     setGenerating(true);
     try {
@@ -117,27 +108,56 @@ export default function Dashboard() {
     setGenerating(false);
   }
 
-  // ─── 行内记录（极速版） ───
-  async function quickRecord(exerciseId: string, _category: string) {
+  // 通用AI对话录入
+  async function submitToAI(raw: string, source: 'text' | 'inline', exerciseId?: string) {
+    if (!raw.trim() && !exerciseId) return;
     if (!currentSession) startWorkout('planned');
-    const exKey = exerciseId;
-    const w = inlineWeight[exKey] ? parseFloat(inlineWeight[exKey]) : undefined;
-    const r = inlineReps[exKey] ? parseInt(inlineReps[exKey]) : undefined;
-    const d = inlineDuration[exKey] ? parseInt(inlineDuration[exKey]) : undefined;
-    if (!w && !r && !d) return;
-    addSet({ exerciseId, weight: w, reps: r, duration: d });
-    setInlineWeight(prev => ({ ...prev, [exKey]: '' }));
-    setInlineReps(prev => ({ ...prev, [exKey]: '' }));
-    setInlineDuration(prev => ({ ...prev, [exKey]: '' }));
-    setShowRest(true);
-    const ex = DEFAULT_EXERCISES.find(e => e.id === exerciseId);
-    if (hasApiKey()) {
-      try { const c = await setFeedback(ex?.name || '', w, r, d); setSetComment(c); }
-      catch { setSetComment(''); }
-    } else { setSetComment(''); }
+
+    setAwaitingAI(true); setParseError('');
+    setAiChats(prev => [...prev, { role: 'user', text: raw || '(行内录入)', time: Date.now() }]);
+
+    try {
+      if (exerciseId && source === 'inline') {
+        // 行内录入
+        const ex = DEFAULT_EXERCISES.find(e => e.id === exerciseId);
+        const w = inlineWeight[exerciseId] ? parseFloat(inlineWeight[exerciseId]) : undefined;
+        const r = inlineReps[exerciseId] ? parseInt(inlineReps[exerciseId]) : undefined;
+        const d = inlineDuration[exerciseId] ? parseInt(inlineDuration[exerciseId]) : undefined;
+        const text = `${ex?.name} ${w ? w + 'kg' : ''} ${r ? r + '次' : ''} ${d ? d + '分钟' : ''}`.trim();
+        if (!text) { setAwaitingAI(false); return; }
+        const res = await coachChat(text);
+        if (res) {
+          addSet({ exerciseId, weight: w, reps: r, duration: d }, res.comment);
+          setInlineWeight(prev => ({ ...prev, [exerciseId]: '' }));
+          setInlineReps(prev => ({ ...prev, [exerciseId]: '' }));
+          setInlineDuration(prev => ({ ...prev, [exerciseId]: '' }));
+          setAiChats(prev => [...prev, { role: 'coach', text: res.comment, time: Date.now() }]);
+        }
+      } else {
+        // 文字输入
+        const res = await coachChat(raw);
+        if (res) {
+          addSet({ exerciseId: res.parsed.exerciseId, weight: res.parsed.weight, reps: res.parsed.reps, distance: res.parsed.distance, duration: res.parsed.duration, rpe: res.parsed.rpe }, res.comment);
+          setTextInput('');
+          setAiChats(prev => [...prev, { role: 'coach', text: res.comment, time: Date.now() }]);
+        } else {
+          setParseError('没识别到动作。试试说清楚一点？');
+        }
+      }
+    } catch (e: any) { setParseError(e.message || 'AI通信失败'); }
+    setAwaitingAI(false);
   }
 
-  // ─── 跳过动作 ───
+  // 行内快速记录
+  function quickRecord(exerciseId: string) {
+    submitToAI('', 'inline', exerciseId);
+  }
+
+  // 文字输入
+  function handleTextSubmit(raw: string) { submitToAI(raw, 'text'); }
+  function handleKeyDown(e: React.KeyboardEvent) { if (e.key === 'Enter' && !awaitingAI) handleTextSubmit(textInput); }
+
+  // 跳过动作
   async function handleSkipExercise() {
     if (!plan) return;
     const ex = plan.exercises[currentExIndex];
@@ -145,51 +165,22 @@ export default function Dashboard() {
     const e = DEFAULT_EXERCISES.find(x => x.id === ex.exerciseId);
     const msg = await skipComment(e?.name || ex.exerciseId, e?.category || 'strength');
     setSkipMsg(msg); setTimeout(() => setSkipMsg(''), 3000);
+    setAiChats(prev => [...prev, { role: 'coach', text: msg, time: Date.now() }]);
     setCurrentExIndex(prev => Math.min(prev + 1, (plan?.exercises.length || 1) - 1));
   }
 
-  // ─── 底部文字输入（AI解析） ───
-  async function handleTextSubmit(raw: string) {
-    if (!raw.trim()) return;
-    if (!currentSession) startWorkout('freestyle');
-    setParsing(true); setParseError('');
-    try {
-      const parsed = await parseUserInput(raw);
-      if (parsed) {
-        addSet({ exerciseId: parsed.exerciseId, weight: parsed.weight, reps: parsed.reps, duration: parsed.duration, rpe: parsed.rpe });
-        setTextInput(''); setShowRest(true);
-        if (hasApiKey()) {
-          try { const c = await setFeedback(parsed.exerciseName, parsed.weight, parsed.reps, parsed.duration, parsed.rpe); setSetComment(c); }
-          catch { setSetComment(''); }
-        }
-      } else { setParseError('没识别到动作。试试"高位下拉25公斤8次刚好"'); }
-    } catch (e: any) { setParseError(e.message || '解析失败'); }
-    setParsing(false);
-  }
-
-  function handleKeyDown(e: React.KeyboardEvent) { if (e.key === 'Enter') handleTextSubmit(textInput); }
   function getSetsForExercise(exId: string) { return sets.filter(s => s.exerciseId === exId); }
 
   const currentPlanEx = plan?.exercises[currentExIndex];
-  const currentExercise = currentPlanEx ? DEFAULT_EXERCISES.find(e => e.id === currentPlanEx.exerciseId) : null;
   const isLastExercise = currentExIndex >= (plan?.exercises.length || 1) - 1;
-
-  // ─── 今日状态 ───
   const today = new Date().toISOString().slice(0, 10);
   const todayTrained = sets.length > 0 || lastSession?.date === today;
-  const dayOfWeek = new Date().getDay();
-  const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-  const restDayMsg = isWeekend ? '周末放松，走走也好 🚶' : '今日休息，肌肉在生长 💪';
-
   const greeting = () => { const h = new Date().getHours(); if (h < 6) return '夜深了'; if (h < 9) return '早上好'; if (h < 12) return '上午好'; if (h < 14) return '中午好'; if (h < 18) return '下午好'; return '晚上好'; };
 
-  // ═════════════════ 渲染 ═════════════════
-
   if (loading) return <div className="flex items-center justify-center h-full" style={{ color: 'var(--color-text3)' }}>加载中...</div>;
-  if (showRest && isResting) return <RestOverlay seconds={restSeconds} nextExercise={currentExercise?.name || ''} comment={setComment} onSkip={() => { skipRest(); setShowRest(false); setSetComment(''); }} />;
   if (isAnalyzing) return <div className="flex flex-col items-center justify-center h-full pb-24 safe-top"><p style={{ fontSize: '48px' }}>🧠</p><p style={{ fontSize: '16px', color: 'var(--color-text2)', marginTop: '12px' }}>臻臻在分析你的训练...</p></div>;
 
-  // ─── 训练完成 ───
+  // 完成
   if (feedback) {
     const strSets = sets.filter(s => { const e = DEFAULT_EXERCISES.find(x => x.id === s.exerciseId); return e?.category === 'strength' || e?.category === 'bodyweight'; });
     const totalVolume = strSets.reduce((sum, s) => sum + (s.weight || 0) * (s.reps || 0), 0);
@@ -199,12 +190,11 @@ export default function Dashboard() {
     const exercisesDone = [...new Set(sets.map(s => { const e = DEFAULT_EXERCISES.find(x => x.id === s.exerciseId); return e?.name || s.exerciseId; }))];
     return (
       <div className="flex flex-col h-full overflow-y-auto px-5 pb-24 safe-top">
-        <div className="text-center pt-6 pb-4"><p style={{ fontSize: '48px', margin: 0 }}>🏁</p><h2 style={{ fontSize: '24px', fontWeight: 800, margin: '8px 0 0', letterSpacing: '-0.5px' }}>训练完成</h2></div>
+        <div className="text-center pt-6 pb-4"><p style={{ fontSize: '48px', margin: 0 }}>🏁</p><h2 style={{ fontSize: '24px', fontWeight: 800, margin: '8px 0 0' }}>训练完成</h2></div>
         <div className="rounded-2xl p-4 mb-4" style={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
           <h3 style={{ fontSize: '14px', fontWeight: 600, margin: '0 0 12px', color: 'var(--color-text2)' }}>📊 今日数据</h3>
           <div className="grid grid-cols-2 gap-3">
-            <StatBox label="总组数" value={`${sets.length}`} unit="组" />
-            <StatBox label="力量组" value={`${strSets.length}`} unit="组" />
+            <StatBox label="总组数" value={`${sets.length}`} unit="组" /><StatBox label="力量组" value={`${strSets.length}`} unit="组" />
             {totalVolume > 0 && <StatBox label="总容量" value={`${totalVolume.toLocaleString()}`} unit="kg" />}
             {totalDuration > 0 && <StatBox label="有氧时长" value={`${totalDuration}`} unit="分钟" />}
             {totalDistance > 0 && <StatBox label="有氧距离" value={`${totalDistance}`} unit="km" />}
@@ -221,7 +211,7 @@ export default function Dashboard() {
     );
   }
 
-  // ─── 引导 ───
+  // 引导
   if (onboardStep === 'chatting') {
     return (
       <div className="flex flex-col h-full pb-24 safe-top">
@@ -240,23 +230,18 @@ export default function Dashboard() {
   // ═════════════════ 主界面 ═════════════════
   return (
     <div className="flex flex-col h-full pb-24 safe-top">
-      {/* 问候 + 周状态 */}
+      {/* 问候 */}
       <div className="px-5 pt-6 pb-3">
-        <h1 style={{ fontSize: '28px', fontWeight: 700, margin: 0, letterSpacing: '-0.5px' }}>{greeting()}，yooyy</h1>
+        <h1 style={{ fontSize: '28px', fontWeight: 700, margin: 0 }}>{greeting()}，yooyy</h1>
         <div className="flex items-center gap-2 mt-1.5">
-          {todayTrained ? (
-            <span style={{ fontSize: '14px', color: 'var(--color-green)' }}>✅ 今天已练</span>
-          ) : weekly.trainedDays > 0 ? (
-            <span style={{ fontSize: '14px', color: 'var(--color-accent)' }}>本周 {weekly.trainedDays}/{weekly.goalDays} 天</span>
-          ) : (
-            <span style={{ fontSize: '14px', color: 'var(--color-text2)' }}>💤 本周还没开始</span>
-          )}
-          {!todayTrained && weekly.trainedDays === 0 && new Date().getDay() !== 1 && (
-            <span style={{ fontSize: '13px', color: 'var(--color-text3)' }}>{restDayMsg}</span>
-          )}
-          {getAIStatus() === 'no-key' && <span style={{ fontSize: '12px', color: 'var(--color-text3)', marginLeft: 'auto' }}>⚠️ 未配置AI</span>}
-          {getAIStatus() === 'error' && <span style={{ fontSize: '12px', color: 'var(--color-red)', marginLeft: 'auto' }}>🔴 AI连接失败</span>}
-          {getAIStatus() === 'connected' && <span style={{ fontSize: '12px', color: 'var(--color-green)', marginLeft: 'auto' }}>🤖 AI就绪</span>}
+          {todayTrained ? <span style={{ fontSize: '14px', color: 'var(--color-green)' }}>✅ 今天已练</span>
+          : weekly.trainedDays > 0 ? <span style={{ fontSize: '14px', color: 'var(--color-accent)' }}>本周 {weekly.trainedDays}/{weekly.goalDays} 天</span>
+          : <span style={{ fontSize: '14px', color: 'var(--color-text2)' }}>💤 本周还没开始</span>}
+          <span style={{ fontSize: '12px', marginLeft: 'auto' }}>
+            {getAIStatus() === 'connected' ? <span style={{ color: 'var(--color-green)' }}>🤖 AI就绪</span>
+            : getAIStatus() === 'no-key' ? <span style={{ color: 'var(--color-text3)' }}>⚠️ 未配置AI</span>
+            : <span style={{ color: 'var(--color-red)' }}>🔴 AI离线</span>}
+          </span>
         </div>
         {skipMsg && <div className="mt-2 p-2 rounded-lg text-sm" style={{ backgroundColor: 'var(--color-surface2)', color: 'var(--color-text2)' }}>{skipMsg}</div>}
       </div>
@@ -267,7 +252,6 @@ export default function Dashboard() {
           <h2 style={{ fontSize: '16px', fontWeight: 600, margin: 0 }}>📋 今日计划</h2>
           <button onClick={handleGeneratePlan} disabled={generating} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>{generating ? '生成中...' : plan ? '重新生成' : '生成计划'}</button>
         </div>
-
         {plan ? (
           <div className="flex flex-col gap-2">
             {plan.exercises.map((ex, i) => {
@@ -280,30 +264,22 @@ export default function Dashboard() {
               const exKey = ex.exerciseId;
               const isCardio = exercise?.category === 'cardio';
               const isStretch = exercise?.category === 'stretch';
-
               return (
                 <div key={i} className="rounded-xl overflow-hidden" style={{ backgroundColor: hasSets ? 'rgba(92,184,120,0.1)' : isCurrent ? 'var(--color-surface2)' : 'var(--color-surface)', border: `1.5px solid ${hasSets ? 'var(--color-green)' : isCurrent ? 'var(--color-accent)' : 'transparent'}`, opacity: isFuture ? 0.35 : 1 }}>
-                  {/* 动作头部 */}
                   <div className="flex items-center justify-between px-4 py-2.5">
                     <div className="flex items-center gap-2">
-                      <span style={{ fontSize: '14px' }}>{isPast ? '✅' : isCurrent ? '▶️' : '⬛'}</span>
+                      <span>{isPast ? '✅' : isCurrent ? '▶️' : '⬛'}</span>
                       <span className="font-medium" style={{ fontSize: '15px', color: isFuture ? 'var(--color-text3)' : 'var(--color-text)' }}>{i + 1}. {exercise?.name || ex.exerciseId}</span>
                     </div>
                     <span style={{ fontSize: '13px', color: 'var(--color-text3)' }}>{ex.targetSets}×{ex.targetReps}</span>
                   </div>
-
-                  {/* 已记录组 */}
                   {hasSets && (
-                    <div className="px-4 pb-1 flex flex-wrap gap-x-3 gap-y-0.5" style={{ fontSize: '12px', color: 'var(--color-text3)' }}>
+                    <div className="px-4 pb-1 flex flex-wrap gap-x-3" style={{ fontSize: '12px', color: 'var(--color-text3)' }}>
                       {exSets.map((s, j) => (
-                        <span key={s.id}>
-                          {j + 1}: {[s.weight && `${s.weight}kg`, s.reps && `${s.reps}次`, s.duration && `${s.duration}分钟`, s.rpe && `RPE ${s.rpe}`].filter(Boolean).join(' ')}
-                        </span>
+                        <span key={s.id}>{j + 1}: {[s.weight && `${s.weight}kg`, s.reps && `${s.reps}次`, s.duration && `${s.duration}分钟`, s.rpe && `RPE ${s.rpe}`].filter(Boolean).join(' ')}</span>
                       ))}
                     </div>
                   )}
-
-                  {/* 行内输入（仅当前动作） */}
                   {isCurrent && (
                     <div className="px-4 pb-2.5 pt-1 flex items-center gap-2" style={{ borderTop: hasSets ? '1px solid var(--color-border)' : 'none' }}>
                       {isCardio || isStretch ? (
@@ -314,14 +290,12 @@ export default function Dashboard() {
                           <input type="number" inputMode="numeric" value={inlineReps[exKey] || ''} onChange={e => setInlineReps(prev => ({ ...prev, [exKey]: e.target.value }))} placeholder="次" className="w-16 px-3 py-2 rounded-lg text-sm outline-none" style={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-border)', color: 'var(--color-text)' }} />
                         </>
                       )}
-                      <button onClick={() => quickRecord(ex.exerciseId, exercise?.category || 'strength')} className="shrink-0 px-4 py-2 rounded-lg text-sm font-semibold" style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>记录</button>
+                      <button onClick={() => quickRecord(ex.exerciseId)} className="shrink-0 px-4 py-2 rounded-lg text-sm font-semibold" style={{ backgroundColor: 'var(--color-accent)', color: '#000' }}>记录</button>
                     </div>
                   )}
                 </div>
               );
             })}
-
-            {/* 当前动作操作 */}
             {currentPlanEx && (
               <div className="flex gap-2 mt-1">
                 <button onClick={handleSkipExercise} className="flex-1 py-2 rounded-lg text-sm font-medium" style={{ backgroundColor: 'var(--color-surface2)', color: 'var(--color-text2)' }}>{isLastExercise ? '完成全部 →' : '跳过此动作 →'}</button>
@@ -333,14 +307,27 @@ export default function Dashboard() {
         )}
       </div>
 
-      <div className="flex-1" />
+      {/* AI对话区 */}
+      {aiChats.length > 0 && (
+        <div className="flex-1 overflow-y-auto px-5">
+          <div className="flex flex-col gap-2 pb-2">
+            {aiChats.filter(c => c.role === 'coach').slice(-3).map((chat, i) => (
+              <div key={i} className="rounded-xl p-3 slide-up" style={{ backgroundColor: 'var(--color-surface)', border: '1px solid var(--color-border)' }}>
+                <span style={{ fontSize: '12px', color: 'var(--color-accent)', fontWeight: 600 }}>臻臻</span>
+                <p style={{ fontSize: '14px', lineHeight: 1.7, color: 'var(--color-text2)', margin: '4px 0 0', whiteSpace: 'pre-wrap' }}>{chat.text}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      {aiChats.length === 0 && <div className="flex-1" />}
 
-      {/* 底部输入 + 完成按钮 */}
+      {/* 底部对话输入 */}
       <div className="px-5 py-3" style={{ borderTop: '1px solid var(--color-border)' }}>
         {parseError && <div className="mb-2 p-2 rounded-lg text-sm" style={{ backgroundColor: 'rgba(224,85,85,0.1)', color: 'var(--color-red)' }}>{parseError} <button onClick={() => setParseError('')} className="underline ml-2">知道了</button></div>}
         <div className="flex gap-2 items-center">
-          <input ref={inputRef} type="text" value={textInput} onChange={e => setTextInput(e.target.value)} onKeyDown={handleKeyDown} placeholder={parsing ? 'AI 解析中...' : '额外补充：跑步20分钟刚好'} disabled={parsing} className="flex-1 px-4 py-3 rounded-xl text-base outline-none" style={{ backgroundColor: 'var(--color-surface)', border: '1.5px solid var(--color-border)', color: 'var(--color-text)' }} />
-          <button onClick={() => handleTextSubmit(textInput)} disabled={parsing || !textInput.trim()} className="shrink-0 w-12 h-12 rounded-xl flex items-center justify-center text-lg font-bold" style={{ backgroundColor: 'var(--color-accent)', color: '#000', opacity: textInput.trim() ? 1 : 0.3 }}>→</button>
+          <input ref={inputRef} type="text" value={textInput} onChange={e => setTextInput(e.target.value)} onKeyDown={handleKeyDown} placeholder={awaitingAI ? '臻臻在思考...' : '跟臻臻说：跑步5km 30分钟有点累'} disabled={awaitingAI} className="flex-1 px-4 py-3 rounded-xl text-base outline-none" style={{ backgroundColor: 'var(--color-surface)', border: '1.5px solid var(--color-border)', color: 'var(--color-text)' }} />
+          <button onClick={() => handleTextSubmit(textInput)} disabled={awaitingAI || !textInput.trim()} className="shrink-0 w-12 h-12 rounded-xl flex items-center justify-center text-lg font-bold" style={{ backgroundColor: 'var(--color-accent)', color: '#000', opacity: textInput.trim() ? 1 : 0.3 }}>→</button>
         </div>
         {currentSession && sets.length > 0 && (
           <div className="flex gap-2 mt-3">
