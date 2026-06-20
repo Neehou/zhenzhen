@@ -221,3 +221,39 @@ export async function getStreak(): Promise<number> {
 
   return streak;
 }
+
+// 本周训练统计
+export async function getWeeklyStats(): Promise<{ trainedDays: number; goalDays: number; weekStart: string }> {
+  const now = new Date();
+  const dayOfWeek = now.getDay(); // 0=Sun
+  const monday = new Date(now);
+  monday.setDate(now.getDate() - (dayOfWeek === 0 ? 6 : dayOfWeek - 1));
+  const weekStart = monday.toISOString().slice(0, 10);
+  const weekEnd = now.toISOString().slice(0, 10);
+
+  const sessions = await db.workoutSessions
+    .where('date')
+    .between(weekStart, weekEnd, true, true)
+    .toArray();
+
+  const trainedDays = new Set(sessions.map(s => s.date)).size;
+
+  const profile = await getOrCreateProfile();
+  const goalDays = profile.weeklyDays || 3;
+
+  return { trainedDays, goalDays, weekStart };
+}
+
+// 获取所有训练过的日期
+export async function getTrainedDates(days: number = 30): Promise<string[]> {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+  const sessions = await db.workoutSessions
+    .where('date')
+    .between(cutoffStr, '9999-99-99', true, true)
+    .toArray();
+
+  return [...new Set(sessions.map(s => s.date))].sort();
+}
