@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { HashRouter, Routes, Route } from 'react-router-dom';
 import Navigation from './components/Navigation';
 import Dashboard from './pages/Dashboard';
 import Training from './pages/Training';
@@ -7,7 +7,7 @@ import Settings from './pages/Settings';
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <HashRouter>
       <div className="flex flex-col h-full max-w-lg mx-auto" style={{ backgroundColor: 'var(--color-bg)' }}>
         <main className="flex-1 overflow-y-auto">
           <Routes>
@@ -19,6 +19,6 @@ export default function App() {
         </main>
         <Navigation />
       </div>
-    </BrowserRouter>
+    </HashRouter>
   );
 }
